@@ -2,7 +2,7 @@
 
 ## Multiplexed IF analysis
 
-- For Halo->RDA used: ver/halo_v3.5.1 of the HaloX repo
+- For Halo->RDA used: https://github.com/mskcc/cHL-pre-processing, which is a fork of `HaloX` repo branch `ver/halo_v3.5.1`
 
 *scripts/misc* contains R scripts for cell reassignments, UMAP clustering, HRS aggregate analysis. 
 
