@@ -1,0 +1,838 @@
+---
+title: "hodgkin_lymphoma_analysis"
+output: html_notebook
+---
+
+Analyzing and plotting NanoString, RNA seq, and some mpIF results for Hodgkin lymphoma project
+
+```{r}
+
+### load libraries, nCounter output raw data file, samples meta data file, counts/percentages for markers in total cells (DAPI) and tumor cells
+
+library(openxlsx)
+library(readxl)
+library(DESeq2)
+library(ggplot2)
+library(dplyr)
+library(pheatmap)
+library(usefun)
+library(Kendall)
+library(ggpubr)
+library(tidyverse)
+library(dendsort)
+library(ggrepel)
+library(mosaic)
+library(gplots)
+library(cowplot)
+library(stringr)
+library(EnhancedVolcano)
+library(RColorBrewer)
+library(biomaRt)
+
+# define path
+path <- ""
+
+rawcounts <- read.csv(paste(path, "nanostring_rawcounts.csv", sep=""), header = TRUE, row.names = NULL, stringsAsFactors = FALSE, sep = ",")
+normcounts <- read.csv(paste(path, "nanostring_normcounts.csv", sep=""), header = TRUE, row.names = NULL, stringsAsFactors = FALSE, sep = ",")
+samples <- read.xlsx(paste(path, "samples.xlsx", sep=""), colNames = TRUE, rowNames = FALSE)
+lm22 <- read.csv(paste(path, "2016_Newman_NatMethods_PMID_25822800_lm22.csv", sep=""), header = TRUE, row.names = NULL, stringsAsFactors = FALSE, sep = ",")
+gsea_pathways_final <- read.xlsx(paste(path, "annotate_gene_sets_nanostring.xlsx", sep=""), colNames = TRUE, rowNames = FALSE)
+cibersort <- read.table(paste(path, "nanostring_CIBERSORT.csv", sep=""), header = TRUE, sep = ",")
+mpif_celltype <- read_excel(paste(path, "mpif_celltype_counts.xlsx", sep=""), sheet = "Subtype_by_CellDive_ID")
+total_rna <- read.table(paste(path, "rnaseq_rawdata.txt", sep=""), header = TRUE, sep = "\t")
+cibersort_totalRNA <- read.table(paste(path, "rnaseq_CIBERSORT.csv", sep=""), header = TRUE, sep = ",")
+gsea_totalRNA <- read_excel(paste(path, "rnaseq_gsea.xlsx", sep=""), sheet = "Sheet2")
+hrsagg <- read_excel(paste(path, "hrsagg.xlsx", sep=""))
+hrsagg_detail <- read_excel(paste(path, "hrsagg_detail.xlsx", sep=""))
+hrscov <- read_excel(paste(path, "hrscov.xlsx", sep=""), sheet = "CovPerPt")
+hrscov_order <- read.csv(paste(path, "hrscov_order.csv", sep=""), header = TRUE, stringsAsFactors = FALSE, sep = ",")
+HRS_agpres <- read.csv(paste(path, "HRS_agpres.csv", sep=""), header = TRUE, stringsAsFactors = FALSE, sep = ",")
+hrs_states_cohort <- read_excel(paste(path, "hrs_states.xlsx", sep=""), sheet = "Cohort-level_data")
+hrs_states_patient <- read.csv(paste(path, "hrs_states_patient.csv", sep=""), header = TRUE, stringsAsFactors = FALSE, sep = ",")
+hrs_states_ptcov <- read.csv(paste(path, "hrs_states_ptcov.csv", sep=""), header = TRUE, stringsAsFactors = FALSE, sep = ",")
+
+print("library and files loaded")
+```
+
+```{r}
+
+### reformat NanoString count file to gene (x) by sample (y) matrix using Patient_ID, drop unwanted samples
+
+drop_cols <- c("X20190924_09631.G.cart1_PanelStandard_12.RCC", 
+               "X20190924_09631.G.cart2_PanelStandard_12.RCC", 
+               "X20190925_09631.G.cart3_PanelStandard_12.RCC", 
+               "X20190925_09631.G.cart4_PanelStandard_12.RCC")
+
+reformat <- function(ncounter_output_file, drop_cols, samples_meta){
+  ncounter_output_file <- ncounter_output_file %>% 
+    filter(!row_number() %in% c(1, 2)) %>% 
+    filter(Class.Name == "Endogenous") %>% 
+    column_to_rownames(var = "Probe.Name") %>% 
+    dplyr::select(-c(1:18)) %>% 
+    dplyr::select(-all_of(drop_cols))
+  new_col_names <- list()
+  for (i in colnames(ncounter_output_file)){
+    new_name <- str_split(i, "_")[[1]][3]
+    new_name <- gsub('[.]', "_", new_name)
+    new_col_names <- append(new_col_names, new_name)
+  }
+  colnames(ncounter_output_file) <- new_col_names
+  # subset samples meta to include only UNTREATED samples with nanostring (32 total)
+  samples_nanostring <- samples %>% 
+    filter(!is.na(Nanostring_ID)) %>% 
+    filter(Treatment == "Untreated")
+  rownames(samples_nanostring) <- samples_nanostring$Patient_ID
+  # list of samples with nanostring data that will not be included in analysis
+  drop <- outersect(samples_nanostring$Nanostring_ID, colnames(ncounter_output_file))
+  # drop those samples from counts, reorder columns to match row order in meta_nanostring
+  new_order <- samples_nanostring$Nanostring_ID
+  ncounter_output_file <- ncounter_output_file %>% 
+    dplyr::select(-all_of(drop)) %>% 
+    dplyr::select(all_of(new_order))
+  # replace column names from nanostring ID to patient ID
+  colnames(ncounter_output_file) <- samples_nanostring$Patient_ID
+  # convert values in counts to numeric
+  ncounter_output_file <- mutate_all(ncounter_output_file, function(x) as.numeric(as.character(x)))
+  return(list(ncounter_output_file, samples_nanostring))
+}
+
+reformat_rawcounts_temp <- reformat(ncounter_output_file = rawcounts, drop_cols = drop_cols, samples_meta = samples)
+reformat_rawcounts <- reformat_rawcounts_temp[[1]]
+samples_nanostring <- reformat_rawcounts_temp[[2]]
+reformat_rawcounts_temp <- reformat(ncounter_output_file = normcounts, drop_cols = drop_cols, samples_meta = samples)
+reformat_normcounts <- reformat_rawcounts_temp[[1]]
+rm(reformat_rawcounts_temp)
+
+print("gene by sample matrix created")
+```
+
+```{r}
+
+### differential expression with deseq2 by 'EBV_final'
+
+identical(colnames(reformat_rawcounts), rownames(samples_nanostring))
+
+dds_EBV <- DESeqDataSetFromMatrix(countData=reformat_rawcounts, colData=samples_nanostring, design=~EBV_final)
+dds_EBV$EBV_final <- relevel(dds_EBV$EBV_final, "Negative")
+dds_EBV <- DESeq(dds_EBV)
+res_EBV <- results(dds_EBV, contrast = c("EBV_final", "Positive", "Negative"))
+res_Ordered_EBV <- res_EBV[order(res_EBV$padj),]
+res_Ordered_EBV <- data.frame(GeneID = rownames(res_Ordered_EBV), res_Ordered_EBV)
+
+print("differential expression completed")
+```
+
+```{r}
+
+### create volcano plot
+
+# get list of lm22 genes that are significant
+lm22_genes_total <- lm22 %>% 
+  replace(lm22=="", "NA")
+lm22_genes <- unique(unlist(lm22))
+# sig DE lm22 genes
+lm22_sig <- intersect(rownames(res_Ordered_EBV %>% dplyr::filter(padj < 0.05)), lm22_genes)
+# sig DE lm22 genes in top 20
+lm22_sig_top20 <- intersect(rownames(res_Ordered_EBV %>% dplyr::filter(padj < 0.05))[1:20], lm22_genes)
+# sig DE lm22 genes in sig different cibersort cell types
+a <- intersect(lm22$T_cells_CD4_memory_resting, lm22_sig)
+b <- intersect(lm22$T_cells_CD8, lm22_sig)
+c <- intersect(lm22$Macrophages_M1, lm22_sig)
+d <- intersect(lm22$Dendritic_cells_activated, lm22_sig)
+cibersort_de_genes <- union(a, b)
+cibersort_de_genes <- union(cibersort_de_genes, c)
+cibersort_de_genes <- union(cibersort_de_genes, d)
+label <- union(rownames(res_Ordered_EBV)[1:20], cibersort_de_genes)
+
+p <- EnhancedVolcano(res_EBV, 
+    lab = rownames(res_EBV), 
+    x = 'log2FoldChange', 
+    y = 'padj', 
+    title = 'EBV positive versus EBV negative',
+    pCutoff = 0.05,
+    FCcutoff = 0,
+    pointSize = 3.0,
+    labSize = 4.0, 
+    col=c('grey69', 'grey69', 'grey69', 'red3'),
+    colAlpha = 0.7,
+    cutoffLineType = 'dashed',
+    cutoffLineCol = 'black',
+    cutoffLineWidth = 0.8,
+    hline = c(0.01, 0.001),
+    hlineCol = c('black', 'black'),
+    hlineType = c('dashed', 'dashed'),
+    hlineWidth = c(0.8, 0.8),
+    gridlines.major = FALSE,
+    gridlines.minor = FALSE, 
+    selectLab = label, 
+    drawConnectors = TRUE,
+    widthConnectors = 0.75) +
+    ggplot2::coord_cartesian(ylim=c(0, 13)) +
+    ggplot2::scale_y_continuous(breaks=seq(0, 13, 3)) +
+    ggplot2::coord_cartesian(xlim=c(-6, 6)) +
+    ggplot2::scale_x_continuous(breaks=seq(-6, 6, 2))
+p
+# ggsave("EBV_volcano.pdf", 
+#        plot = p, 
+#        device = "pdf", 
+#        width = 200, 
+#        height = 200, 
+#        units = "mm")
+
+print("volcano done!")
+```
+
+```{r}
+
+### prep data for gene expression heatmap
+
+format_results_for_heatmap <- function(normcounts, res_Ordered, p_val, meta){
+  # filter significant DE genes, reorder by log2FoldChange
+  DE_filter <- dplyr::filter(res_Ordered, as.numeric(res_Ordered$padj) < p_val)
+  DE_filter <- DE_filter[order(DE_filter$log2FoldChange, decreasing=TRUE),]
+  # subset DE genes, reorder by log2FoldChange, take log2/zscore
+  all_subset <- subset(normcounts, rownames(normcounts) %in% rownames(DE_filter))
+  all_subset <- all_subset[order(match(rownames(all_subset), rownames(DE_filter))), ]
+  #log2_normcounts <- log2(all_subset)
+  zscore_normcounts <- apply(all_subset, 1, zscore)
+  zscore_normcounts <- data.frame(t(zscore_normcounts))
+  #reorder columns by comparison variable and inter-variable ordering (first set negatives to zero)
+  zscore_normcounts_reorder <- zscore_normcounts %>% 
+    mutate_all(list(~ifelse(. < 0, 0, .))) %>% 
+    summarise_all(sum) %>% 
+    t() %>% 
+    as.data.frame() %>% 
+    base::merge((meta %>% dplyr::select(EBV_final)), by = 'row.names') %>% 
+    arrange(desc(EBV_final), -V1) %>% 
+    column_to_rownames(var = "Row.names")
+  zscore_normcounts <- zscore_normcounts %>% dplyr::select(rownames(zscore_normcounts_reorder))
+  return (zscore_normcounts)
+}
+
+zscore_normcounts_EBV_0.05 <- format_results_for_heatmap(normcounts = reformat_normcounts, res_Ordered = res_Ordered_EBV, 
+                                                p_val = 0.05, meta = samples_nanostring)
+
+print("data prepered!")
+```
+
+```{r}
+
+### create gene expression heatmap DE genes
+
+# reformat gsea gene sets for heatmap row annotations
+gsea_pathways_final_reformat <- data.frame(matrix(0, ncol=ncol(gsea_pathways_final), nrow=nrow(reformat_rawcounts)))
+row.names(gsea_pathways_final_reformat) <- row.names(reformat_rawcounts)
+colnames(gsea_pathways_final_reformat) <- colnames(gsea_pathways_final)
+for (i in 1:ncol(gsea_pathways_final_reformat)){
+  gsea_pathways_final_reformat[,i] <- row.names(gsea_pathways_final_reformat) %in% gsea_pathways_final[,i]
+}
+gsea_pathways_final_reformat[gsea_pathways_final_reformat == FALSE] <- "-"
+gsea_pathways_final_reformat[gsea_pathways_final_reformat == TRUE] <- "+"
+
+# define annotation colors
+annot_colors <- list(EBV_final = c("Negative"="#A7BEAE", "Positive"="#B85042"), 
+                    Age_Diagnosis_Group = c("under45"="#e2cfea", "over45"="#bb8588"), 
+                    Neutrophils = c("+"="grey10", "-"="grey90"), 
+                    KEGG_ANTIGEN_PROCESSING_AND_PRESENTATION = c("+"="grey10", "-"="grey90"), 
+                    KEGG_NATURAL_KILLER_CELL_MEDIATED_CYTOTOXICITY = c("+"="grey10", "-"="grey90"), 
+                    WIELAND_UP_BY_HBV_INFECTION = c("+"="grey10", "-"="grey90"), 
+                    REACTOME_IMMUNOREGULATORY_INTERACTIONS_BETWEEN_A_LYMPHOID_AND_A_NON_LYMPHOID_CELL = c("+"="grey10", "-"="grey90"), 
+                    KEGG_GRAFT_VERSUS_HOST_DISEASE = c("+"="grey10", "-"="grey90"), 
+                    HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION = c("+"="grey10", "-"="grey90"), 
+                    Interferon_alpha_beta_gamma_HR = c("+"="grey10", "-"="grey90"))
+
+make_heatmap <- function(zscore_normcounts, meta, annot_col_labels, annot_row = NULL, annot_colors, col_break, row_break = NULL, title){
+  annot_col <- meta %>% dplyr::select(annot_col_labels)
+  my_breaks <- seq(-2,2, by=0.1)
+  my_color <- colorpanel(n = length(my_breaks) - 1, low = "blue", mid = "grey88", high = "red")
+  x <- pheatmap(zscore_normcounts, legend = T, color = my_color, breaks = my_breaks, show_colnames = T, show_rownames = T, 
+         cluster_rows = F, cluster_cols = F, annotation_col = annot_col, annotation_row = annot_row, 
+         gaps_col = c(col_break), gaps_row = c(row_break), annotation_colors = annot_colors, annotation_legend = T, angle_col = 90, 
+         border_color = "white", main = paste(title, "sorted by L2FC"))
+  ggsave(paste(title, "_heatmap.pdf", sep = ""),
+       plot = x,
+       device = "pdf",
+       width = 600,
+       height = 600,
+       units = "mm")
+}
+
+# resort rows by consistency
+row_order_df <- zscore_normcounts_EBV_0.05 %>% dplyr::select("HL_19", "HL_23", "HL_32", "HL_33", "HL_18", "HL_21", "HL_15") %>% 
+  dplyr::filter(rownames(.) %in% rownames(res_Ordered_EBV %>% dplyr::filter(padj < 0.05) %>% 
+  dplyr::filter(log2FoldChange > 0)))
+row_order_df[row_order_df < 0] <- 0
+row_order_df[row_order_df > 0] <- 1
+row_order_df <- row_order_df %>% mutate(total = rowSums(.)) %>% 
+  arrange(desc(total))
+row_order <- rownames(row_order_df)
+row_order_df <- zscore_normcounts_EBV_0.05 %>% dplyr::select(!c("HL_19", "HL_23", "HL_32", "HL_33", "HL_18", "HL_21", "HL_15")) %>% 
+  dplyr::filter(rownames(.) %in% rownames(res_Ordered_EBV %>% dplyr::filter(padj < 0.05) %>% 
+  dplyr::filter(log2FoldChange < 0)))
+row_order_df[row_order_df < 0] <- 0
+row_order_df[row_order_df > 0] <- 1
+row_order_df <- row_order_df %>% mutate(total = rowSums(.)) %>% 
+  arrange(desc(total))
+row_order <- append(row_order, rownames(row_order_df))
+zscore_normcounts_EBV_0.05 <- zscore_normcounts_EBV_0.05 %>% arrange(match(rownames(.), row_order))
+
+# EBV heatmap with gsea signatures FINAL, 0.05
+make_heatmap(zscore_normcounts = zscore_normcounts_EBV_0.05, meta = samples_nanostring, 
+             annot_col_labels = c("EBV_final", "Age_Diagnosis_Group"), 
+             annot_row = gsea_pathways_final_reformat, 
+             annot_colors = annot_colors, col_break = 7, row_break = 71,
+             title = "EBV comparison_padj0.05")
+
+print("done!")
+
+```
+
+```{r}
+
+### CIBERSORT (NanoString)
+
+# compare cibersort fractions by EBV
+cibersort_celltype_order <- c("T.cells.CD4.naive", "T.cells.CD4.memory.resting", "T.cells.CD4.memory.activated", 
+                              "T.cells.follicular.helper", "T.cells.CD8", "T.cells.regulatory..Tregs.", "T.cells.gamma.delta", 
+                              "B.cells.naive", "B.cells.memory", "NK.cells.resting", "NK.cells.activated", "Monocytes", 
+                              "Macrophages.M0", "Macrophages.M1", "Macrophages.M2", "Dendritic.cells.resting",  
+                              "Dendritic.cells.activated", "Mast.cells.resting", "Mast.cells.activated", "Eosinophils", 
+                              "Neutrophils", "Plasma.cells")
+cibersort <- cibersort %>% 
+  dplyr::filter(Mixture %in% samples_nanostring$Patient_ID) %>% 
+  column_to_rownames("Mixture") %>% 
+  dplyr::select(-all_of(c("P.value", "Correlation", "RMSE")))
+cibersort_medians <- cibersort %>% 
+  dplyr::bind_cols(samples_nanostring %>% dplyr::select(EBV_final)) %>% 
+  group_by(EBV_final) %>% 
+  summarise(across(everything(), list(median)))
+p <- cibersort %>% 
+  dplyr::bind_cols(samples_nanostring %>% dplyr::select(EBV_final)) %>% 
+  pivot_longer(!EBV_final, names_to = "celltype", values_to = "fraction") %>% 
+  ggplot(aes(x = factor(celltype, levels = cibersort_celltype_order), y = fraction, fill = factor(EBV_final, levels = c("Positive", "Negative")))) +
+  geom_boxplot(outlier.shape = NA) + 
+  geom_point(position = position_jitterdodge(0.1), size = 0.1) + 
+  scale_fill_manual(values = c("Positive"="#B85042", "Negative"="#A7BEAE")) + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  labs(fill = "EBV status") + 
+  xlab("Cell type") + 
+  ylab("Fraction (%)") + 
+  stat_compare_means(aes(group = EBV_final), method = "wilcox.test", label = "p.format", size = 1)
+p
+# ggsave("cibersort_celltype_by_EBV.pdf", 
+#        plot = p, 
+#        device = "pdf", 
+#        width = 240, 
+#        height = 160, 
+#        units = "mm")
+
+print("done!")
+```
+
+```{r}
+
+### mpIF:NanoString correlation (celltype:celltype)
+
+# using previously filtered samples_nanostring and cibersort
+# drop samples without matched mpIF and nanostring, match cell type categories
+summarize_celltypes <- function(mpif_celltype, cibersort, samples_nanostring){
+  samples_nanostring_sub <- samples_nanostring %>% 
+    filter(!Protein_Multiplexed_IF == 0)
+  drop <- outersect(samples_nanostring_sub$CellDive_ID, colnames(mpif_celltype %>% dplyr::select(-c(Subtype))))
+  mpif_celltype_sub <- mpif_celltype %>% 
+    dplyr::select(-all_of(drop)) %>% 
+    column_to_rownames("Subtype")
+  # replace column names from CellDive ID to patient ID
+  colnames(mpif_celltype_sub) <- samples_nanostring_sub$Patient_ID
+  drop2 <- outersect(rownames(cibersort), samples_nanostring_sub$Patient_ID)
+  cibersort_sub <- cibersort[!(row.names(cibersort) %in% drop2),]
+  mpif_celltype_sub_sum <- mpif_celltype_sub %>% 
+    replace(is.na(.), 0) %>%  
+    t() %>% 
+    as.data.frame() %>% 
+    dplyr::select(-all_of("HRS")) %>% 
+    mutate("Total" = rowSums(.)) %>% 
+    mutate("T_Reg" = rowSums(across(c("T_Reg4", "T_Reg8", "T_RegDN")))) %>% 
+    rename("B_cell" = "B_All") %>% 
+    mutate("NK_cell" = rowSums(across(c("NK", "NKT", "NKT_CD4", "NKT_CD8")))) %>% 
+    rename("Macrophage_M1" = "Macrophage_MHCIIpos") %>% 
+    rename("Macrophage_M2" = "Macrophage_MHCIIneg") %>% 
+    dplyr::select(c("T_CD4", "T_CD8", "T_Reg", "B_cell", "NK_cell", "Macrophage_M1", "Macrophage_M2", "Plasma", "Total")) %>% 
+    mutate_at(vars(-Total), list(~. / Total)) %>% 
+    dplyr::select(-all_of("Total")) %>% 
+    rename("T_CD4_mpif" = "T_CD4", "T_CD8_mpif" = "T_CD8", "T_Reg_mpif" = "T_Reg", "B_cell_mpif" = "B_cell", 
+           "NK_cell_mpif" = "NK_cell", "Macrophage_M1_mpif" = "Macrophage_M1", "Macrophage_M2_mpif" = "Macrophage_M2", 
+           "Plasma_cell_mpif" = "Plasma")
+  colnames(cibersort_sub) <- gsub('[.]', "_", colnames(cibersort_sub))
+  cibersort_sub_sum <- cibersort_sub %>% 
+    rename("T_cells_regulatory_Tregs" = "T_cells_regulatory__Tregs_") %>% 
+    dplyr::select(-all_of(c("T_cells_gamma_delta", "Mast_cells_resting", "Mast_cells_activated", "Eosinophils", "Neutrophils"))) %>% 
+    mutate("T_CD4" = rowSums(across(c("T_cells_CD4_naive", "T_cells_CD4_memory_resting", 
+                                "T_cells_CD4_memory_activated", "T_cells_follicular_helper")))) %>% 
+    rename("T_CD8" = "T_cells_CD8") %>% 
+    rename("T_Reg" = "T_cells_regulatory_Tregs") %>% 
+    mutate("B_cell" = rowSums(across(c("B_cells_naive", "B_cells_memory")))) %>% 
+    mutate("NK_cell" = rowSums(across(c("NK_cells_resting", "NK_cells_activated")))) %>% 
+    #mutate("Macrophage_monocyte" = rowSums(across(c("Macrophages_M0", "Macrophages_M1", "Macrophages_M2", "Monocytes", "Dendritic_cells_resting", "Dendritic_cells_activated")))) %>% 
+    rename("Macrophage_M1" = "Macrophages_M1") %>% 
+    rename("Macrophage_M2" = "Macrophages_M2") %>% 
+    dplyr::select(all_of(c("T_CD4", "T_CD8", "T_Reg", "B_cell", "NK_cell", "Macrophage_M1", "Macrophage_M2", "Plasma_cells"))) %>% 
+    rename("T_CD4_rna" = "T_CD4", "T_CD8_rna" = "T_CD8", "T_Reg_rna" = "T_Reg", "B_cell_rna" = "B_cell", 
+           "NK_cell_rna" = "NK_cell", "Macrophage_M1_rna" = "Macrophage_M1", "Macrophage_M2_rna" = "Macrophage_M2", 
+           "Plasma_cell_rna" = "Plasma_cells")
+  return(list(mpif_celltype_sub_sum, cibersort_sub_sum, samples_nanostring_sub))
+}
+
+mpif_celltype_sum_temp <- summarize_celltypes(mpif_celltype = mpif_celltype, cibersort = cibersort, samples_nanostring = samples_nanostring)
+mpif_celltype_sum <- mpif_celltype_sum_temp[[1]]
+cibersort_sum <- mpif_celltype_sum_temp[[2]]
+samples_nanostring_sub <- mpif_celltype_sum_temp[[3]]
+rm(mpif_celltype_sum_temp)
+
+# correlate mpIF and cibersort cell types
+bind <- cbind(mpif_celltype_sum, cibersort_sum)
+# create list of celldive, cibersort pairs
+plot_list <- data.frame(matrix(ncol = 2, nrow = ncol(cibersort_sum)))
+colnames(plot_list) <- c('mpif', 'cibersort')
+plot_list$mpif <- colnames(mpif_celltype_sum)
+plot_list$cibersort <- colnames(cibersort_sum)
+# create list of all the scatter plots with gene/protein correlation at the sample level and print
+plts <- list()
+for (i in 1:nrow(plot_list)){
+  p <- ggscatter(bind, x = plot_list$mpif[i], y = plot_list$cibersort[i], 
+            add ="reg.line", # Add regression line, 
+            add.params = list(color = "grey", fill = "lightgray"), # Customize reg. line
+            conf.int = TRUE, 
+            xlab = paste(str_remove(plot_list$mpif[i], "_mpif"), "(mpIF, % immune)"), 
+            ylab =  paste(str_remove(plot_list$cibersort[i], "_rna"), "(cibersort)")) # Add confidence interval 
+  p <- p + stat_cor(method = "pearson", cor.coef.name	="R")
+  print(p)
+  plts[[i]] <- p  # add each plot into plot list
+}
+# ggsave("mpIF_nanostring_celltype_correl.pdf", 
+#        gridExtra::marrangeGrob(grobs = plts, nrow = 3, ncol = 3),
+#        device = "pdf", 
+#        width = 300, 
+#        height = 300, 
+#        units = "mm")
+
+# add EBV_final color to scatter plot (CD8 and M1 only)
+p <- bind %>% bind_cols(samples_nanostring_sub %>% dplyr::select(EBV_final)) %>% 
+  ggscatter(x = "T_CD8_mpif", y = "T_CD8_rna", 
+            color = "EBV_final", 
+            add ="reg.line", # Add regressin line, 
+            add.params = list(color = "grey", fill = "lightgray"), # Customize reg. line
+            conf.int = TRUE, 
+            xlab = "T_CD8 (mpIF, % immune)", 
+            ylab =  "T_CD8 (cibersort)", 
+            palette = c("Positive"="#B85042", "Negative"="#A7BEAE")) # Add confidence interval 
+p <- p + stat_cor(method = "pearson", cor.coef.name	="R")
+p
+# ggsave("mpIF_nanostring_celltype_correl_CD8.pdf", 
+#        plot = p, 
+#        device = "pdf", 
+#        width = 120, 
+#        height = 120, 
+#        units = "mm")
+p <- bind %>% bind_cols(samples_nanostring_sub %>% dplyr::select(EBV_final)) %>% 
+  ggscatter(x = "Macrophage_M1_mpif", y = "Macrophage_M1_rna", 
+            color = "EBV_final", 
+            add ="reg.line", # Add regressin line, 
+            add.params = list(color = "grey", fill = "lightgray"), # Customize reg. line
+            conf.int = TRUE, 
+            xlab = "M1 (mpIF, % immune)", 
+            ylab =  "M1 (cibersort)", 
+            palette = c("Positive"="#B85042", "Negative"="#A7BEAE")) # Add confidence interval 
+p <- p + stat_cor(method = "pearson", cor.coef.name	="R")
+p
+# ggsave("mpIF_nanostring_celltype_correl_M1.pdf", 
+#        plot = p, 
+#        device = "pdf", 
+#        width = 120, 
+#        height = 120, 
+#        units = "mm")
+
+print("mpIF:NanoString correlation done!")
+```
+
+```{r}
+
+### RNA sequencing analysis
+
+mart <- useMart(biomart = "ensembl", dataset = "hsapiens_gene_ensembl")
+# reformat results
+total_rna_reformat <- total_rna %>% 
+  dplyr::select(all_of(c("GeneID", "HL_17_R1", "HL_18_R1_a", "HL_30_R2", "HL_33_R2", "HL_34_R1", "HL_38_R1", "HL_39_R1"))) %>% 
+  rename("HL_17" = "HL_17_R1", "HL_18" = "HL_18_R1_a", "HL_30" = "HL_30_R2", "HL_33" = "HL_33_R2", "HL_34" = "HL_34_R1", "HL_38" = "HL_38_R1", "HL_39" = "HL_39_R1")
+total_rna_reformat$GeneID <- gsub("\\..*", "", total_rna_reformat[,1])
+IDs <- getBM(attributes = c("ensembl_gene_id","hgnc_symbol"), 
+             filters = "ensembl_gene_id", 
+             values = total_rna_reformat[,1], 
+             mart = mart)
+total_rna_reformat <- total_rna_reformat %>% 
+  rename("ensembl_gene_id"= "GeneID") %>% 
+  merge(IDs, by = "ensembl_gene_id")
+# remove rows without hgnc
+total_rna_reformat <- total_rna_reformat[!(is.na(total_rna_reformat$hgnc_symbol) | total_rna_reformat$hgnc_symbol==""), ]
+# remove rows with repeated hgnc
+repeated_hgnc <- total_rna_reformat$hgnc_symbol[-pmatch(unique(total_rna_reformat$hgnc_symbol), total_rna_reformat$hgnc_symbol)]
+total_rna_reformat <- total_rna_reformat %>% 
+  filter(!hgnc_symbol %in% repeated_hgnc) %>% 
+  column_to_rownames("hgnc_symbol") %>% 
+  dplyr::select(-all_of("ensembl_gene_id"))
+
+# subset samples meta to include only UNTREATED samples with total RNA (7 total)
+samples_total_rna <- samples %>% 
+  filter(!RNA_Total_RNA == 0) %>% 
+  filter(Treatment == "Untreated")
+rownames(samples_total_rna) <- samples_total_rna$Patient_ID_old
+# cibersort, compare fractions by EBV
+cibersort_celltype_order <- c("T.cells.CD4.naive", "T.cells.CD4.memory.resting", "T.cells.CD4.memory.activated", 
+                              "T.cells.follicular.helper", "T.cells.CD8", "T.cells.regulatory..Tregs.", "T.cells.gamma.delta", 
+                              "B.cells.naive", "B.cells.memory", "NK.cells.resting", "NK.cells.activated", "Monocytes", 
+                              "Macrophages.M0", "Macrophages.M1", "Macrophages.M2", "Dendritic.cells.resting", 
+                              "Dendritic.cells.activated", "Mast.cells.resting", "Mast.cells.activated", "Eosinophils", 
+                              "Neutrophils", "Plasma.cells")
+cibersort_totalRNA <- cibersort_totalRNA %>% 
+  dplyr::filter(Mixture %in% samples_total_rna$Patient_ID_old) %>% 
+  column_to_rownames("Mixture") %>% 
+  dplyr::select(-all_of(c("P.value", "Correlation", "RMSE")))
+cibersort_medians_totalrna <- cibersort_totalRNA %>% 
+  bind_cols(samples_total_rna %>% dplyr::select(all_of("EBV_final"))) %>% 
+  group_by(EBV_final) %>% 
+  summarise(across(everything(), list(median)))
+p <- cibersort_totalRNA %>% 
+  bind_cols(samples_total_rna %>% dplyr::select(all_of("EBV_final"))) %>% 
+  pivot_longer(!EBV_final, names_to = "celltype", values_to = "fraction") %>% 
+  ggplot(aes(x = factor(celltype, levels = cibersort_celltype_order), y = fraction, 
+             fill = factor(EBV_final, levels = c("Positive", "Negative")))) +
+  geom_boxplot(outlier.shape = NA) + 
+  geom_point(position = position_jitterdodge(0.1), size = 0.1) + 
+  scale_fill_manual(values = c("Positive"="#B85042", "Negative"="#A7BEAE")) + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  labs(fill = "EBV status") + 
+  xlab("Cell type") + 
+  ylab("Fraction (%)") + 
+  stat_compare_means(aes(group = EBV_final), method = "t.test", label = "p.format", size = 1)
+p
+# ggsave("cibersort_celltype_by_EBV_totalRNA.pdf", 
+#        plot = p, 
+#        device = "pdf", 
+#        width = 240, 
+#        height = 160, 
+#        units = "mm")
+# cibersort NanoString/cibersort total RNA correlation
+cibersort_totalRNAsamplesonly <- cibersort %>% 
+  filter(rownames(cibersort) %in% samples_total_rna$Patient_ID)
+colnames(cibersort_totalRNAsamplesonly) <- paste(colnames(cibersort_totalRNAsamplesonly), "nano", sep="_")
+bind <- cbind(cibersort_totalRNAsamplesonly, cibersort_totalRNA)
+# create list of celldive, cibersort pairs
+plot_list <- data.frame(matrix(ncol = 2, nrow = ncol(cibersort_totalRNAsamplesonly)))
+colnames(plot_list) <- c('nano', 'totalRNA')
+plot_list$nano <- colnames(cibersort_totalRNAsamplesonly)
+plot_list$totalRNA <- colnames(cibersort_totalRNA)
+# create list of all the scatter plots with gene/protein correlation at the sample level and print
+plts <- list()
+for (i in 1:nrow(plot_list)){
+  p <- ggscatter(bind, x = plot_list$nano[i], y = plot_list$totalRNA[i], 
+            add ="reg.line", # Add regression line, 
+            add.params = list(color = "grey", fill = "lightgray"), # Customize reg. line
+            conf.int = TRUE, 
+            xlab = paste(str_remove(plot_list$nano[i], "_nano"), "(NanoString)"), 
+            ylab =  paste(plot_list$totalRNA[i], "(Total RNA)")) # Add confidence interval
+  p <- p + stat_cor(method = "pearson", cor.coef.name	="R")
+  print(p)
+  plts[[i]] <- p  # add each plot into plot list
+}
+# ggsave("nano_totalRNA_cibersort_correl.pdf", 
+#        gridExtra::marrangeGrob(grobs = plts, nrow = 5, ncol = 5),
+#        device = "pdf", 
+#        width = 300, 
+#        height = 300, 
+#        units = "mm")
+
+# differential expression by 'EBV_final'
+# make sure column names of count file = row names of meta data file
+identical(colnames(total_rna_reformat), rownames(samples_total_rna))
+dds_EBV_total <- DESeqDataSetFromMatrix(countData=total_rna_reformat, colData=samples_total_rna, design=~EBV_final)
+dds_EBV_total$EBV_final <- relevel(dds_EBV_total$EBV_final, "Negative")
+dds_EBV_total <- DESeq(dds_EBV_total)
+res_EBV_total <- results(dds_EBV_total, contrast = c("EBV_final", "Positive", "Negative"))
+res_Ordered_EBV_total <- res_EBV_total[order(res_EBV_total$padj),]
+res_Ordered_EBV_total <- data.frame(GeneID = rownames(res_Ordered_EBV_total), res_Ordered_EBV_total)
+res_Ordered_EBV_total$GeneID <- gsub("\\..*", "", res_Ordered_EBV_total[,1])
+
+# volcano, top 20 genes from both total and NanoString labeled
+nano_genes_top20 <- rownames(res_Ordered_EBV %>% dplyr::filter(padj < 0.05))[1:20]
+totalrna_genes_top20 <- rownames(res_Ordered_EBV_total %>% dplyr::filter(padj < 0.05))[1:20]
+sig_overlap_genes <- intersect(rownames(res_Ordered_EBV %>% dplyr::filter(padj < 0.05)), rownames(res_Ordered_EBV_total %>% dplyr::filter(padj < 0.05)))
+label <- union(nano_genes_top20, totalrna_genes_top20)
+label <- union(label, sig_overlap_genes)
+p <- EnhancedVolcano(res_Ordered_EBV_total, 
+    lab = rownames(res_Ordered_EBV_total), 
+    x = 'log2FoldChange', 
+    y = 'padj', 
+    title = 'EBV positive versus EBV negative',
+    pCutoff = 0.05,
+    FCcutoff = 0,
+    pointSize = 3.0,
+    labSize = 4.0, 
+    col=c('grey69', 'grey69', 'grey69', 'red3'),
+    colAlpha = 0.7,
+    cutoffLineType = 'dashed',
+    cutoffLineCol = 'black',
+    cutoffLineWidth = 0.8,
+    hline = c(0.01, 0.001),
+    hlineCol = c('black', 'black'),
+    hlineType = c('dashed', 'dashed'),
+    hlineWidth = c(0.8, 0.8),
+    gridlines.major = FALSE,
+    gridlines.minor = FALSE, 
+    selectLab = label, 
+    drawConnectors = TRUE,
+    widthConnectors = 0.75) + 
+    ggplot2::coord_cartesian(ylim=c(0, 6)) +
+    ggplot2::scale_y_continuous(breaks=seq(0, 6, 1)) +
+    ggplot2::coord_cartesian(xlim=c(-24, 24)) +
+    ggplot2::scale_x_continuous(breaks=seq(-24, 24, 4))
+p
+# ggsave("EBV_totalRNA_volcano.pdf", 
+#        plot = p, 
+#        device = "pdf", 
+#        width = 200, 
+#        height = 200, 
+#        units = "mm")
+
+# plot GSEA results
+gsea_totalRNA_reformat <- gsea_totalRNA %>% 
+  dplyr::filter(LEADING_EDGE_tags > 0.28) %>% 
+  dplyr::arrange(NES) %>% 
+  mutate(order = rownames(.))
+my_breaks <- seq(0, 1, by = 0.1)
+my_color <- colorpanel(n = length(my_breaks) - 1, low = "blue", mid = "grey88", high = "red")
+x <- ggplot(gsea_totalRNA_reformat, aes(x = NES, y = factor(NAME, levels = NAME))) + 
+  geom_point(aes(size = LEADING_EDGE_tags, color = FDR_qval)) + 
+  scale_size_continuous(range = c(8, 20), breaks = c(0.3, 0.4, 0.5, 0.6, 0.7, 0.8)) + 
+  scale_x_continuous(limits = c(-4, 4), breaks = c(-3, -2, -1, 0, 1, 2, 3)) + 
+  scale_color_gradientn(colors = c("red", "#dddddd", "#cccccc", "#bbbbbb", "#a3a3a3"), 
+                        breaks = c(0, 0.05, 0.25, 0.5, 0.75, 1), 
+                        values = c(0, 0.05, 0.25, 0.5, 0.75, 1), guide = guide_colorbar(reverse = TRUE), limits = c(0, 1)) + 
+  theme_classic()
+# ggsave("totalRNA_gsea.pdf", 
+#        plot = x, 
+#        device = "pdf", 
+#        width = 700, 
+#        height = 700, 
+#        units = "mm")
+
+print("done!")
+```
+
+```{r}
+
+### mpIF HRS aggregates/NanoString DE
+
+# aggregates by patient
+samples_mpif <- samples %>% filter(Protein_Multiplexed_IF == 1) %>% arrange(desc(EBV_final))
+hrsagg <- hrsagg %>% arrange(Patient_ID) %>% 
+  arrange(desc(EBV_final))
+# total aggregates EBV+/-
+p <- hrsagg %>% ggplot(aes(x = factor(EBV_final, levels = c("Positive", "Negative")), y = NAgg)) +
+  geom_bar(stat="identity") + 
+  xlab("Pos6_Neg1064_noAggs") + 
+  ylab("No. HRS aggregates") + 
+  theme_classic()
+# ggsave("HRSagg_totalcount.pdf", 
+#        plot = p, 
+#        device = "pdf", 
+#        width = 100, 
+#        height = 100, 
+#        units = "mm")
+# total aggregates PER FOV EBV+/-
+p <- hrsagg %>% ggplot(aes(x = factor(EBV_final, levels = c("Positive", "Negative")), y = NAgg, color = EBV_final)) +
+  geom_boxplot() + 
+  geom_jitter(shape=16, position=position_jitter(0.2)) + 
+  scale_color_manual(values=c("#A7BEAE", "#B85042")) + 
+  ylab("No. HRS aggregates per FOV") + 
+  theme_classic() + 
+  stat_compare_means(method = "wilcox.test", label = "p.format")
+# ggsave("HRSagg_aggregates_per_FOV.pdf", 
+#        plot = p, 
+#        device = "pdf", 
+#        width = 100, 
+#        height = 100, 
+#        units = "mm")
+# fraction of HRS cells in an aggregate per FOV
+p <- hrsagg %>% ggplot(aes(x = factor(EBV_final, levels = c("Positive", "Negative")), y = PCT.HRS.Agg, color = EBV_final)) + 
+  geom_boxplot(outlier.shape = NA) + 
+  geom_jitter(shape=16, position=position_jitter(0.2)) + 
+  scale_color_manual(values=c("#A7BEAE", "#B85042")) + 
+  theme_classic() + 
+  #geom_hline(yintercept = 0.25, linetype = "dashed", color = "black") + 
+  stat_compare_means()
+wilcox.test(PCT.HRS.Agg ~ EBV_final, data = hrsagg %>% dplyr::select(c("EBV_final", "PCT.HRS.Agg")),
+                   exact = FALSE)
+# ggsave("HRSagg_percentaggregatescells.pdf", 
+#        plot = p, 
+#        device = "pdf", 
+#        width = 100, 
+#        height = 100, 
+#        units = "mm")
+# total number of clustered FOVs by EBV
+p <- hrsagg %>% mutate(clustered_yes = case_when(HRSStatus == "Clustered" ~ 1, 
+                             HRSStatus == "Dispersed" ~ 0)) %>% 
+  ggplot(aes(x = factor(EBV_final, levels = c("Positive", "Negative")), y = clustered_yes)) +
+  geom_bar(stat="identity") + 
+  ylab("No. clustered FOVs") + 
+  theme_classic()
+# ggsave("HRSagg_num_aggregatesFOVs.pdf", 
+#        plot = p, 
+#        device = "pdf", 
+#        width = 100, 
+#        height = 100, 
+#        units = "mm")
+# number of cells per aggregate EBV+/- (cutoff at 20 cells)
+p <- hrsagg_detail %>% dplyr::filter(ClusterSize >= 20) %>% 
+  ggplot(aes(x = factor(EBV_final, levels = c("Positive", "Negative")), y = ClusterSize, color = EBV_final)) + 
+  geom_boxplot() + 
+  geom_jitter(shape=16, position=position_jitter(0.2)) + 
+  scale_color_manual(values=c("#A7BEAE", "#B85042")) + 
+  theme_classic() + 
+  scale_y_continuous(trans='log10') + 
+  geom_hline(yintercept = 20, linetype = "dashed", color = "black") + 
+  xlab("No_HRS_cells_per_aggregate") + 
+  stat_compare_means(method = "wilcox.test", label = "p.format")
+# ggsave("HRSagg_cellsperaggregate.pdf", 
+#        plot = p, 
+#        device = "pdf", 
+#        width = 100, 
+#        height = 100, 
+#        units = "mm")
+
+print("done!")
+
+```
+
+```{r}
+
+### COV plots
+
+#heatmap
+hrscov_reformat <- hrscov %>% pivot_wider(names_from = Patient_ID_FINAL, values_from = COV) 
+hrscov_reformat <- hrscov_reformat[order(match(hrscov_reformat$Population, hrscov_order$Population)), ] %>% 
+  column_to_rownames("Population")
+my_breaks <- seq(0, 3, by = 0.1)
+my_color <- colorpanel(n = length(my_breaks) - 1, low = "#d0efff", mid = "#187bcd", high = "#03254c")
+p <- pheatmap(hrscov_reformat, cluster_rows = F, cluster_cols = F, color = my_color, breaks = my_breaks, border_color = "white")
+# ggsave("cov_heatmap.pdf", 
+#        plot = p, 
+#        device = "pdf", 
+#        width = 200, 
+#        height = 200, 
+#        units = "mm")
+#bar plot, find max value omitting HL_17 (only 1 FOV)
+maxcov <- hrscov %>% group_by(Population) %>% summarise(max = max(COV, na.rm=TRUE))
+maxcov <- maxcov[order(match(maxcov$Population, hrscov_order$Population)), ] %>% 
+  as.data.frame()
+p <- ggplot(data = maxcov, aes(x = factor(Population, levels = Population), y = max)) +
+  geom_bar(stat="identity") + coord_flip() + theme_classic() + ylim(0, 3)
+# ggsave("maxcov.pdf", 
+#        plot = p, 
+#        device = "pdf", 
+#        width = 200, 
+#        height = 200, 
+#        units = "mm")
+p <- maxcov %>% arrange(max) %>% 
+  ggplot(aes(x = factor(Population, levels = Population), y = max)) +
+  geom_bar(stat="identity") + coord_flip() + theme_classic() + ylim(0, 3)
+# ggsave("maxcov_orderedbycov.pdf", 
+#        plot = p, 
+#        device = "pdf", 
+#        width = 200, 
+#        height = 200, 
+#        units = "mm")
+# correlations, cohort-level fraction CoV
+p <- ggscatter(hrs_states_cohort, x = "Fraction", y = "CoV", color = "black", size = 3, # Points color, shape and size
+   add = "reg.line",  # Add regression line
+   add.params = list(color = "blue", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "pearson", label.x = 0.5, label.sep = "\n"), 
+   label = "Cell_state", 
+   label.select = c("HRS,B2M", "HRS,MHCI", "HRS,MHCII", "HRS,PDL1"))
+# ggsave("cohort_cov_fraction_correl.pdf", 
+#        plot = p, 
+#        device = "pdf", 
+#        width = 200, 
+#        height = 200, 
+#        units = "mm")
+# patient-level fraction CoV correlation
+hrs_states_patient <- hrs_states_patient %>% pivot_longer(!Cell_state, names_to = "Patient_ID", values_to = "Fraction")
+hrs_states_ptcov <- hrs_states_ptcov %>% pivot_longer(!Cell_state, names_to = "Patient_ID", values_to = "CoV")
+total <- merge(hrs_states_patient, hrs_states_ptcov, by = c("Cell_state", "Patient_ID"))
+p <- total %>% 
+  ggscatter(x = "Fraction", y = "CoV", color = "black", size = 1.5, # Points color, shape and size
+   add = "reg.line",  # Add regression line
+   add.params = list(color = "blue", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "pearson", label.x = 0.5, label.sep = "\n", size = 4)) + 
+  facet_wrap(vars(Patient_ID))
+# ggsave("patient_cov_fraction_correl.pdf", 
+#        plot = p, 
+#        device = "pdf", 
+#        width = 300, 
+#        height = 300, 
+#        units = "mm")
+# patient level fraction CoV for B2M, MHCI, MHCII, PDL1
+p <- total %>% filter(Cell_state %in% c("HRS,B2M", "HRS,MHCI", "HRS,MHCII", "HRS,PDL1")) %>% 
+  merge(samples_mpif %>% dplyr::select(Patient_ID, EBV_final), by = "Patient_ID") %>% 
+  ggscatter(x = "Fraction", y = "CoV", color = "EBV_final", size = 3, # Points color, shape and size
+   add = "reg.line",  # Add regression line
+   add.params = list(color = "blue", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "pearson", label.x = 0.5, label.sep = "\n", size = 5), 
+   palette = c("#A7BEAE", "#B85042")) + 
+  facet_wrap(vars(Cell_state))
+# ggsave("B2M_MHCI_MHCII_PDL2_cov_fraction_correl.pdf", 
+#        plot = p, 
+#        device = "pdf", 
+#        width = 150, 
+#        height = 150, 
+#        units = "mm")
+
+```
+
+```{r}
+
+### B2M/MHCI/MHCII combinations in HRS cells
+
+HRS_agpres <- HRS_agpres %>% merge(samples_mpif %>% dplyr::select(Patient_ID, Patient_ID_old, EBV_final), by = "Patient_ID_old")
+HRS_agpres_sum <- HRS_agpres %>% pivot_wider(!c(n, Patient_ID_old), names_from = Triple, values_from = PCT) %>% 
+  mutate(Impaired = rowSums(across(c("B2M-,MHCI-,MHCII-", "B2M+,MHCI-,MHCII-", "B2M-,MHCI+,MHCII-")), na.rm=TRUE)) %>% 
+  mutate(MHCII_only = rowSums(across(c("B2M-,MHCI-,MHCII+", "B2M+,MHCI-,MHCII+", "B2M-,MHCI+,MHCII+")), na.rm=TRUE)) %>% 
+  mutate(MHCI_MHCII = rowSums(across(c("B2M+,MHCI+,MHCII+", "B2M+,MHCI+,MHCII-")), na.rm=TRUE)) %>% 
+  dplyr::select(Patient_ID, EBV_final, Impaired, MHCII_only, MHCI_MHCII) %>% 
+  pivot_longer(!c(Patient_ID, EBV_final), names_to = "ag_pres", values_to = "PCT")
+  
+p <- HRS_agpres_sum %>% ggplot(aes(x = factor(ag_pres, levels = c("MHCI_MHCII", "MHCII_only", "Impaired")), y = PCT, fill = factor(EBV_final, levels = c("Positive", "Negative")))) + 
+  geom_point(position = position_jitterdodge()) + 
+  geom_boxplot(outlier.shape = NA) + 
+  scale_fill_manual(values=c("#B85042", "#A7BEAE")) + 
+  theme_classic() + 
+  stat_compare_means(aes(group = EBV_final), method = "wilcox.test", label = "p.format", size = 5) + 
+  ylab("% HRS cells") + 
+  xlab("Antigen presentation machinery") + 
+  labs(fill = "EBV status")
+p
+# ggsave("agpres_singlecell.pdf", 
+#        plot = p, 
+#        device = "pdf", 
+#        width = 200, 
+#        height = 150, 
+#        units = "mm")
+wilcox.test(PCT ~ EBV_final, data = HRS_agpres_sum %>% filter(ag_pres == "MHCII_only"),
+                   exact = FALSE)
+
+```

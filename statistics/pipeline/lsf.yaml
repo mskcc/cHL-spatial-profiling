@@ -1,0 +1,6 @@
+__default__:
+  name: "hodgkins_{rule}.{wildcards}" 
+  stdout: "logs/hodgkins_{rule}.{wildcards}.log"
+  stderr: "logs/hodgkins_{rule}.{wildcards}.log"
+
+

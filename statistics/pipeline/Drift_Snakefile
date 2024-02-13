@@ -1,0 +1,223 @@
+import glob
+import sys
+import os
+import pandas as pd
+from snakemake.utils import validate, min_version
+
+min_version("5.1.2")
+
+configfile: "input/config/study_config.yaml"
+
+
+src = "/home/byrne/halo/dev/hodgkins_dev"
+drift_src = src + '/drift_detection'
+image_magick = src + '/bin/ImageMagick-7.0.11-7'
+tmp_dir = '/juno/work/bic/byrne/tmp'
+tumor_type = 'hodgkin'            ### has to match what is in drift_detection.cpp
+
+## read ALL meta data
+meta = pd.read_excel(config['meta_data_file'], sheet_name = 'flat')
+
+## this file is currently included in Snakefile, but not sure yet how to get sample list from that file, so
+## including that code here for now as well. this is obviously problematic if the code doesn't match exactly in both files
+#
+## get sample list
+#
+SAMPLES = meta.CellDive_ID.unique().tolist()
+## currently we are running samples as they become available, so check for files in halo_csv dir 
+SAMPLES = [os.path.splitext(x)[0] for x in os.listdir("input/halo_csv")]
+
+#
+# convert subset of meta data pertaining to drift into
+# a dictionary for easier reference
+#
+def get_drift_config(meta):
+    drift_dat = meta[["CellDive_ID", "FOV_number", "DAPI_first", "DAPI_last", "Microscope", "Pixel_to_micron", "Image_type"]]
+    drift_config = {}
+    for samp in SAMPLES:
+        samp_dat = drift_dat[drift_dat.CellDive_ID == samp]
+        dapi1 = int(samp_dat.DAPI_first.unique().tolist()[0].lstrip('S0'))
+        dapiN = int(samp_dat.DAPI_last.unique().tolist()[0].lstrip('S0'))
+        drift_config[samp] = {'FOV': [str(x).zfill(3) for x in samp_dat.FOV_number.unique().tolist()],
+                              'DAPI_first': samp_dat.DAPI_first.unique().tolist()[0],
+                              'DAPI_last': samp_dat.DAPI_last.unique().tolist()[0],
+                              'cycles': ['S' + str(x).zfill(3) for x in list(range(dapi1 + 1, dapiN + 1))],
+                              'Pixel_to_micron': samp_dat.Pixel_to_micron.unique().tolist()[0],
+                              'Image_type': 'spot' if samp_dat.Image_type.unique().tolist()[0] == 'FOV' else 'region',
+                              'detect_drift_mem': 120 if samp_dat.Image_type.unique().tolist()[0] == 'WS' else 10,
+                              'microscope': 'incell2000' if samp_dat.Microscope.unique().tolist()[0] == 'Incell 2500' else 'cytell'}
+    
+    return drift_config
+
+
+## get drift parameters by sample
+drift_config = get_drift_config(meta)
+
+
+#
+# get full path to tif file of one staining cycle
+# of one FOV from one sample. this is the image to which
+# all subsequent staining cycles will be compared
+#
+def cycle_1_fov_halo_image(wildcards):
+    return expand(config['halo_image_dir'] + 
+                  '/{{sample}}/' +
+                  drift_config[wildcards.sample]['DAPI_first'] + 
+                  '/' + drift_config[wildcards.sample]['DAPI_first'] + 
+                  '_' + config['image_identifier_string'] +
+                  '_' + drift_config[wildcards.sample]['Image_type'] +
+                  '_{{fov}}.tif')
+
+#
+# get full path to tif file of the current staining
+# cycle of one FOV from one sample
+#
+def current_cycle_fov_halo_image(wildcards):
+    return expand(config['halo_image_dir'] + 
+                   '/{{sample}}/{{cycle}}/{{cycle}}_' + 
+                   config['image_identifier_string'] + 
+                   '_' + drift_config[wildcards.sample]['Image_type'] + 
+                   '_{{fov}}.tif')
+
+#
+# get full paths to overlays and diff_mask tif files
+# of all FOVs from one sample for all staining cycles
+#
+def all_sample_drift_images(wildcards):
+    return expand(config['drift_mask_dir'] +
+                  '/{{sample}}/{dapi1}_{cycle}/{dapi1}_{cycle}_{fov}/{{sample}}_{dapi1}_{cycle}_{fov}_{type}.tif',
+                  dapi1 = drift_config[wildcards.sample]['DAPI_first'],
+                  cycle = drift_config[wildcards.sample]['cycles'], 
+                  fov = drift_config[wildcards.sample]['FOV'], 
+                  type = ['overlay', 'diff_mask'])
+
+
+##
+## detect drift for one cycle in one fov of one sample
+##
+rule sample_cycle_fov_drift:
+    input:
+        cycle_1_fov_halo_image, 
+        current_cycle_fov_halo_image 
+    output:
+        config['drift_mask_dir'] + "/{sample}/{dapi1}_{cycle}/{dapi1}_{cycle}_{fov}/{sample}_{dapi1}_{cycle}_{fov}_overlay.tif",
+        config['drift_mask_dir'] + "/{sample}/{dapi1}_{cycle}/{dapi1}_{cycle}_{fov}/{sample}_{dapi1}_{cycle}_{fov}_diff_mask.tif"
+    params:
+        dapi1 = lambda wildcards: drift_config[wildcards.sample]['DAPI_first'],
+        pixel_to_micron = lambda wildcards: drift_config[wildcards.sample]['Pixel_to_micron'] 
+    resources:
+        #mem = lambda wildcards: drift_config[wildcards.sample]['detect_drift_mem'],
+        #runtime = 30000 
+    shell:
+        'if [[ "{wildcards.sample}" == "H17_173" ]]; then\n ' + 
+        "   ln -s /juno/res/bic/shared/Multiomyx/HaloData/Hodgkin_Lymphoma_ALLcases/Drift/Zeng/drift_mask/H17_173_2_4_SLN/{params.dapi1}_{wildcards.cycle}/{params.dapi1}_{wildcards.cycle}_{wildcards.fov}/H17_173_2_4_SLN_{params.dapi1}_{wildcards.cycle}_{wildcards.fov}_overlay.tif " + config['drift_mask_dir'] + "/{wildcards.sample}/{params.dapi1}_{wildcards.cycle}/{params.dapi1}_{wildcards.cycle}_{wildcards.fov}/{wildcards.sample}_{params.dapi1}_{wildcards.cycle}_{wildcards.fov}_overlay.tif;\n  " +
+        "   ln -s /juno/res/bic/shared/Multiomyx/HaloData/Hodgkin_Lymphoma_ALLcases/Drift/Zeng/drift_mask/H17_173_2_4_SLN/{params.dapi1}_{wildcards.cycle}/{params.dapi1}_{wildcards.cycle}_{wildcards.fov}/H17_173_2_4_SLN_{params.dapi1}_{wildcards.cycle}_{wildcards.fov}_diff_mask.tif " + config['drift_mask_dir'] + "/{wildcards.sample}/{params.dapi1}_{wildcards.cycle}/{params.dapi1}_{wildcards.cycle}_{wildcards.fov}/{wildcards.sample}_{params.dapi1}_{wildcards.cycle}_{wildcards.fov}_diff_mask.tif\n" +
+        'elif [[ "{wildcards.sample}" == "H16_6077" ]]; then\n ' +          
+        "   ln -s /juno/res/bic/shared/Multiomyx/HaloData/Hodgkin_Lymphoma_ALLcases/Drift/Zeng/drift_mask/H16_6077_2_1_BLN/{params.dapi1}_{wildcards.cycle}/{params.dapi1}_{wildcards.cycle}_{wildcards.fov}/H16_6077_2_1_BLN_{params.dapi1}_{wildcards.cycle}_{wildcards.fov}_overlay.tif " + config['drift_mask_dir'] + "/{wildcards.sample}/{params.dapi1}_{wildcards.cycle}/{params.dapi1}_{wildcards.cycle}_{wildcards.fov}/{wildcards.sample}_{params.dapi1}_{wildcards.cycle}_{wildcards.fov}_overlay.tif;\n  " +
+        "   ln -s /juno/res/bic/shared/Multiomyx/HaloData/Hodgkin_Lymphoma_ALLcases/Drift/Zeng/drift_mask/H16_6077_2_1_BLN/{params.dapi1}_{wildcards.cycle}/{params.dapi1}_{wildcards.cycle}_{wildcards.fov}/H16_6077_2_1_BLN_{params.dapi1}_{wildcards.cycle}_{wildcards.fov}_diff_mask.tif " + config['drift_mask_dir'] + "/{wildcards.sample}/{params.dapi1}_{wildcards.cycle}/{params.dapi1}_{wildcards.cycle}_{wildcards.fov}/{wildcards.sample}_{params.dapi1}_{wildcards.cycle}_{wildcards.fov}_diff_mask.tif\n" +
+        "else\n" +
+        "   ln -s /juno/res/bic/shared/Multiomyx/HaloData/Hodgkin_Lymphoma_ALLcases/Drift/Zeng/drift_mask/{wildcards.sample}/{params.dapi1}_{wildcards.cycle}/{params.dapi1}_{wildcards.cycle}_{wildcards.fov}/{wildcards.sample}_{params.dapi1}_{wildcards.cycle}_{wildcards.fov}_overlay.tif " + config['drift_mask_dir'] + "/{wildcards.sample}/{params.dapi1}_{wildcards.cycle}/{params.dapi1}_{wildcards.cycle}_{wildcards.fov}/{wildcards.sample}_{params.dapi1}_{wildcards.cycle}_{wildcards.fov}_overlay.tif; \n" + 
+        "    ln -s /juno/res/bic/shared/Multiomyx/HaloData/Hodgkin_Lymphoma_ALLcases/Drift/Zeng/drift_mask/{wildcards.sample}/{params.dapi1}_{wildcards.cycle}/{params.dapi1}_{wildcards.cycle}_{wildcards.fov}/{wildcards.sample}_{params.dapi1}_{wildcards.cycle}_{wildcards.fov}_diff_mask.tif " + config['drift_mask_dir'] + "/{wildcards.sample}/{params.dapi1}_{wildcards.cycle}/{params.dapi1}_{wildcards.cycle}_{wildcards.fov}/{wildcards.sample}_{params.dapi1}_{wildcards.cycle}_{wildcards.fov}_diff_mask.tif\n" +
+        "fi"
+
+#        drift_src + "/drift_detection detect_drift {input} " +
+#           config['drift_mask_dir'] + 
+#           "/{wildcards.sample}/{params.dapi1}_{wildcards.cycle}/{params.dapi1}_{wildcards.cycle}_{wildcards.fov}/" +
+#           "{wildcards.sample}_{params.dapi1}_{wildcards.cycle}_{wildcards.fov} {wildcards.fov} {params.pixel_to_micron}"
+
+
+##
+## format halo CSV file
+##
+rule format_halo_csv_for_drift_summary:
+    input:
+        config['halo_csv_dir'] + "/{sample}.csv"
+    output:
+        config['drift_summary_dir'] + '/{sample}_object_analysis.txt'
+    shell:
+        drift_src + "/format_object_analysis_file.sh {input} {output}"
+
+
+##
+## summarize all cycles in each sample
+##
+rule drift_sample_summary_and_stats:
+    input:
+        config['drift_summary_dir'] + '/{sample}_object_analysis.txt',
+        all_sample_drift_images
+    output:
+        summary = config['drift_summary_dir'] + '/{sample}_drift_summary.txt',
+        stats = config['drift_summary_dir'] + '/{sample}_drift_summary.txt.stats'
+    resources:
+        mem = 100 
+    params:
+        start = lambda wildcards: drift_config[wildcards.sample]['DAPI_first'].lstrip('S0'),
+        end = lambda wildcards: drift_config[wildcards.sample]['cycles'][-1].lstrip('S0')
+    shell:
+        "export OPENCV_IO_MAX_IMAGE_PIXELS=10000000000 && " + drift_src + "/drift_detection drift_cycle_summary " +
+           config['drift_summary_dir'] + "/{wildcards.sample}_object_analysis.txt " +
+           config['drift_mask_dir'] + "/{wildcards.sample}" +
+           " " + tumor_type + 
+           " {wildcards.sample}" +
+           " {params.start} {params.end}" + 
+           " {output.summary}" 
+
+##
+## compile all overlays and diff_masks for all fovs in all cycles of each sample
+##
+rule drift_sample_image_pdf:
+    input:
+        all_sample_drift_images
+    output:
+        config['drift_pdf_dir'] + '/{sample}_result.pdf'
+    resources:
+        mem = 200,
+        runtime = 30000 
+    shell:
+        "export MAGICK_TMPDIR=" + 
+           tmp_dir + 
+           " && export MAGICK_MEMORY_LIMIT=10240 && export MAGICK_MAP_LIMIT=10240 && " +
+           image_magick + "/bin/convert " +
+           " {input} -resize 1280 -gravity South -splice 0x40 -pointsize 20 -annotate 0 '%f' {output}"
+
+rule sample_scanplan:
+    input:
+        scanplan = glob.glob("/juno/work/bic/shared/data/mellingi/Multiomyx/Hodgkin/*/{sample}/scanplan/scanplan.tif"),
+        moves = glob.glob("/juno/work/bic/shared/data/mellingi/Multiomyx/Hodgkin/*/{sample}/moves.dat")
+    output:
+        config['scanplan_dir'] + "/{sample}_scanplan_AllFOVs.tif",
+        config['scanplan_dir'] + "/{sample}_scanplan_AnalyzedFOVs.tif",
+        config['scanplan_dir'] + "/{sample}_scanplan_coordinate.txt" 
+    shell:
+        "ln -s {input.scanplan} " + config['halo_scanplan_dir'] + "/{wildcards.sample}/ && " +
+        "ln -s {input.moves} " + config['halo_scanplan_dir'] + "/{wildcards.sample}/ && " +
+        drift_src + "/drift_detection draw_fov " +
+        " {wildcards.sample} " +
+        drift_config[wildcards.sample]['microscope'] + " " +
+        config['halo_scanplan_dir'] + "/{wildcards.sample}/scanplan.tif " + 
+        config['halo_scanplan_dir'] + "/{wildcards.sample}/moves.dat " +
+        config['meta_dir'] + "/HodgkinLymphoma_FOVs__V0.txt" +
+        " yes " +
+        config['scanplan_dir'] + "/{wildcards.sample}_scanplan" 
+
+rule draw_scanplans:
+    input:
+        expand(config['halo_scanplan_dir'] + "/{sample}_scanplan_AllFOVs.tif", sample = SAMPLES),
+        expand(config['scanplan_dir'] + "/{sample}_scanplan_AnalyzedFOVs.tif", sample = SAMPLES),
+        expand(config['scanplan_dir'] + "/{sample}_scanplan_coordinate.txt", sample = SAMPLES)
+
+##
+## create overlays & diff masks for all images;
+## compile all generated images in a single PDF per sample;
+## create drift summaries by cycle and by sample
+##
+rule run_drift:
+    input:
+        expand(config['drift_summary_dir'] + '/{sample}_drift_summary.txt', sample = SAMPLES),
+        expand(config['drift_summary_dir'] + '/{sample}_drift_summary.txt.stats', sample = SAMPLES)#,
+        #expand(config['drift_pdf_dir'] + '/{sample}_result.pdf', sample = SAMPLES)
+    output:
+        config['log_dir'] + '/DRIFT_DONE'
+    shell:
+        "touch {output}"
+

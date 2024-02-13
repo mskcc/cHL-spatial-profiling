@@ -1,0 +1,748 @@
+import glob
+import sys
+import os
+import pandas as pd
+from snakemake.utils import validate, min_version
+
+min_version("5.1.2")
+
+config_file = "input/config/study_config.yaml"
+src = "/home/byrne/halo/dev/hodgkins_dev"   ## this will need to be put in config
+Rpath = "/juno/opt/common/bic/R/R-4.0.2/bin"
+
+configfile: config_file
+
+
+def getCurrentMetaFiles(meta_dir):
+    allFiles = os.listdir(meta_dir)
+    fTypes = set([x.split('__')[0] for x in allFiles if not x.startswith('.')])
+    curFiles = []
+    for ft in fTypes:
+        fl = [x for x in allFiles if ft in x]
+        if len(fl) > 1:
+            ver = max([x.split('__V')[1].split('.xlsx')[0] for x in fl])
+            fl = [x for x in fl if 'V' + ver + '.xlsx' in x]
+        fl = os.path.join(meta_dir, fl[0]) 
+        curFiles.append(fl)
+    return curFiles
+
+
+def getSampleFileSfx(path):
+    print(path)
+    print(next(iter(set([x.split("___")[1] for x in os.listdir(path)]))))
+    print("\n")
+    return next(iter(set([x.split("___")[1] for x in os.listdir(path)])))
+
+
+yaml2Rcmd = {'yes': 'TRUE', 'no': 'FALSE'}
+
+
+meta = pd.read_excel(config['meta_data_file'], sheet_name = 'flat')
+metaFiles = getCurrentMetaFiles(config['meta_dir'])
+
+print("\nUsing current meta files:")
+[print(mf) for mf in metaFiles]
+
+SAMPLES = meta.CellDive_ID.unique().tolist()
+SAMPLES = [x for x in SAMPLES if not pd.isnull(x) ]
+
+qFile = [x for x in metaFiles if '_Questions_' in x][0]
+qData = pd.read_excel(qFile)
+
+GENERAL_Q = qData[qData['Neighborhood'].isnull()].QuestionNumber.unique().tolist()
+
+TME_Q = qData[~qData['Neighborhood'].isnull()]
+tmeMarkers = set([x.split(',', 1)[1] for x in TME_Q['Neighborhood'].values if ',' in x])
+tmeMarkers.remove('aggregated')
+TME_Q = TME_Q.QuestionNumber.unique().tolist()
+
+print("SAMPLES: ", SAMPLES, "\n")
+print("GENERAL_Q: ", GENERAL_Q, "\n")
+print("TME_Q: ", TME_Q, "\n")
+
+
+
+print("tmeMarkers: ", tmeMarkers, "\n")
+
+## metrics
+allMetrics = ['counts', 'fractions', 'densities'] 
+genPlotCalcs = ['fractions', 'densities']
+spMetrics = ['counts', 'fractions']
+spPlotCalcs = ['fractions']
+plotExts = ['pdf', 'xlsx']
+
+
+##
+## generate cell states
+##
+rule make_and_index_cell_states:
+    input:
+        cell_states_file = [x for x in metaFiles if 'CellStates' in x], 
+        cell_types_file = [x for x in metaFiles if 'CellTypes' in x] 
+    output:
+        conds_file = config['statistics_conditions_file'],
+        conds_index = config['statistics_conditions_index'] 
+    shell:
+        "{Rpath}/Rscript {src}/scripts/generate_cell_state_conditions.R " +
+            " --meta_dir " + config['meta_dir'] +
+            " --statistics_conditions_file {output.conds_file}" + 
+            " --statistics_index_file {output.conds_index}" +
+            " --index_conditions TRUE"        
+
+##
+## convert rethresholded, marker level data to simplified cell level table
+## and assign all cell classifiers (phenotype labels like type, subtype, etc)
+##
+rule annotate_sample_cells:
+    input:
+        cell_types_file = [x for x in metaFiles if 'CellTypes' in x],
+        sample_file = [x for x in metaFiles if 'Samples' in x],
+        fov_file = [x for x in metaFiles if 'FOVs' in x],
+        marker_file = [x for x in metaFiles if 'Markers' in x],
+        data_file = config['data_dir'] + "/{sample}___" + getSampleFileSfx(config['data_dir'])
+    output:
+        protected(config['cell_data_dir'] + "/{sample}_annotated_cells.rda")
+    resources:
+        threads = int(config['number_threads']),
+        mem = 72 
+    shell:
+        "{Rpath}/Rscript {src}/scripts/annotate_cells.R" +
+            " --annotated_cells_file {output}" +
+            " --data_file {input.data_file}" +
+            " --flex_neg_req " + str(config['flex_neg_req']).upper() +
+            " --meta_dir " + config['meta_dir'] +
+            " --number_threads " + str(config['number_threads']) 
+
+
+##
+## create XLSX file of cell counts summarized by FOV, Sample, cell phenotype, etc.
+##
+rule summarize_cell_counts:
+    input:
+        meta_data_file = config['meta_data_file'],
+        annotated_cells = expand(config['cell_data_dir'] + "/{sample}_annotated_cells.rda", sample=SAMPLES)
+    output:
+        config['cell_type_counts_file']
+    resources:
+        threads = int(config['number_threads']),
+        mem = 96
+    shell:
+        "{Rpath}/Rscript {src}/scripts/count_cell_types.R " +
+             " --cell_data_dir " + config['cell_data_dir'] +
+             " --cell_type_counts_file {output} " +
+             " --flex_neg_req " + str(config['flex_neg_req']).upper() +
+             " --meta_dir " + config['meta_dir'] +
+             " --number_threads " + str(config['number_threads']) 
+
+##
+## count all markers in entire cell population AND
+## count all functional markers in HRS population only
+##
+rule summarize_marker_counts:
+    input:
+        meta_data_file = config['meta_data_file'],
+        annotated_cells = expand(config['cell_data_dir'] + "/{sample}_annotated_cells.rda", sample=SAMPLES)
+    output:
+        config['counts_dir'] + "/all_marker_counts_per_sample.xlsx",
+        config['counts_dir'] + "/tumor_functional_marker_counts_per_sample.xlsx"
+    resources:
+        threads = int(config['number_threads']),
+        mem = 96
+    shell:
+        "{Rpath}/Rscript {src}/scripts/count_markers.R " +
+             " --cell_data_dir " + config['cell_data_dir'] +
+             " --counts_dir " + config['counts_dir'] +
+             " --meta_dir " + config['meta_dir'] +
+             " --number_threads " + str(config['number_threads']) 
+
+##
+## count all cell populations and calculate cell state fractions in each sample (FOV level)
+##
+rule population_counts_and_fractions_per_fov:
+    input:
+        rules.make_and_index_cell_states.output,
+        config['cell_data_dir'] + "/{sample}_annotated_cells.rda",
+        config['annotation_config_file']
+    output:
+        config['fov_metrics_dir'] + "/{sample}_population_counts_per_FOV_ID.rda",
+        config['fov_metrics_dir'] + "/{sample}_population_fractions_per_FOV_ID.rda"
+    resources:
+        threads = int(config['number_threads']),
+        mem = 60
+    shell:
+        "{Rpath}/Rscript {src}/scripts/population_counts_and_fractions.R" +
+             " --annotation_config_file " + config['annotation_config_file'] +
+             " --calc_unit FOV_ID" +
+             " --cell_data_dir " + config['cell_data_dir'] +
+             " --cell_dive_id {wildcards.sample}" +
+             " --force_recalc TRUE"
+             " --meta_dir " + config['meta_dir'] +
+             " --fov_metrics_dir " + config['fov_metrics_dir'] +
+             " --neighbor_dir " + config['neighbor_dir'] +
+             " --number_threads " + str(config['number_threads']) +
+             " --statistics_conditions_index " + config['statistics_conditions_index'] +
+             " --statistics_conditions_file " + config['statistics_conditions_file'] 
+
+'''
+##                                                                              
+## count all cell populations and calculate cell state fractions in each sample (FOV level)
+##                                                                              
+rule hrs_nbhd_population_counts_and_fractions_per_fov:                                   
+    input:                                                                      
+        rules.make_and_index_cell_states.output,                                
+        config['cell_data_dir'] + "/{sample}_annotated_cells.rda",
+        config['neighbor_dir'] + "/{sample}___" + getSampleFileSfx(config['neighbor_dir']),           
+        config['annotation_config_file']                                        
+    output:                                                                     
+        config['hrs_nbhd_metrics_dir'] + "/{sample}_population_counts_per_FOV_ID.rda",
+        config['hrs_nbhd_metrics_dir'] + "/{sample}_population_fractions_per_FOV_ID.rda"
+    resources:                                                                  
+        threads = int(config['number_threads']),                                
+        mem = 48                                                                
+    shell:                                                                      
+        "{Rpath}/Rscript {src}/scripts/population_counts_and_fractions.R" +     
+             " --annotation_config_file " + config['annotation_config_file'] +  
+             " --calc_unit FOV_ID" +                             
+             " --cell_region HRS_nbhd" +               
+             " --cell_data_dir " + config['cell_data_dir'] +                    
+             " --cell_dive_id {wildcards.sample}" +                             
+             " --force_recalc TRUE" + 
+             " --meta_dir " + config['meta_dir'] +                              
+             " --fov_metrics_dir " + config['hrs_nbhd_metrics_dir'] + 
+             " --neighbor_dir " + config['neighbor_dir'] +
+             " --neighborhood_radius " + str(config['neighborhood_radius']) +
+             " --number_threads " + str(config['number_threads']) +             
+             " --statistics_conditions_index " + config['statistics_conditions_index'] +
+             " --statistics_conditions_file " + config['statistics_conditions_file']
+'''
+
+##
+## calculate area of all FOVs
+##
+rule total_area_per_fov:
+    input:
+       config['data_dir'] + "/{sample}___" + getSampleFileSfx(config['data_dir']) 
+    output:
+        config['fov_area_dir'] + "/{sample}_total_area_per_FOV_ID.rda"
+    resources:
+        threads = int(config['number_threads']),
+        mem = 24
+    shell:
+        "{Rpath}/Rscript {src}/scripts/calculate_fov_area.R " +
+            " --data_files {input}" + 
+            " --meta_dir " + config['meta_dir'] +
+            " --fov_area_dir " + config['fov_area_dir'] +
+            " --number_threads " + str(config['number_threads']) +
+            " --cell_dive_id {wildcards.sample} " +
+            " --calc_unit FOV_ID" +
+            " --force_recalc TRUE" 
+ 
+##
+## calculate densities for all populations in each sample (at FOV level)
+##
+rule population_densities_per_fov:
+    input:
+        config['fov_area_dir'] + "/{sample}_total_area_per_FOV_ID.rda",
+        config['fov_metrics_dir'] + "/{sample}_population_counts_per_FOV_ID.rda"
+    output:
+        config['fov_metrics_dir'] + "/{sample}_population_densities_per_FOV_ID.rda"
+    resources:
+        threads = int(config['number_threads']),
+        mem = 20
+    shell:
+        "{Rpath}/Rscript {src}/scripts/population_densities.R " +
+            " --calc_unit FOV_ID" +
+            " --cell_data_dir " + config['cell_data_dir'] +
+            " --cell_dive_id {wildcards.sample} " + 
+            " --force_recalc TRUE " +  
+            " --fov_metrics_dir " + config['fov_metrics_dir'] +
+            " --meta_dir " + config['meta_dir'] +
+            " --number_threads " + str(config['number_threads']) +
+            " --statistics_conditions_file " + config['statistics_conditions_file'] +            
+            " --statistics_conditions_index " + config['statistics_conditions_index'] 
+
+ 
+##
+## calculate and assign microenvironment statuses (Pos.Env, Neg.Env, Mixed.Env, noEnv)
+##
+rule assign_functional_tumor_microenvironments:
+    input:
+        config['cell_data_dir'] + "/{sample}_annotated_cells.rda",
+        config['neighbor_dir'] + "/{sample}___" + getSampleFileSfx(config['neighbor_dir']) 
+    output:
+        config['microenvironment_dir'] + '/{sample}___HRS,{marker}___microenvironments__fPos_' + str(config['positive_cutoff']) + '__minCells_' + str(int(config['min_microenv_cells'])) + '.rda'
+    resources: 
+        threads = int(config['number_threads']),
+        mem = 120
+    shell:
+        "{Rpath}/Rscript {src}/scripts/assign_microenvironments.R " +
+            " --annotated_cells_file " + config['cell_data_dir'] + "/{wildcards.sample}_annotated_cells.rda" +
+            " --neighbor_file " + config['neighbor_dir'] + "/{wildcards.sample}___" + getSampleFileSfx(config['neighbor_dir']) +
+            " --neighbor_cell_class HRS " +
+            " --neighbor_cell_marker_combo {wildcards.marker} " + 
+            " --meta_dir " + config['meta_dir'] +
+            " --microenvironment_dir " + config['microenvironment_dir'] +
+            " --min_microenv_cells " + str(int(config['min_microenv_cells'])) +
+            " --positive_cutoff " + str(config['positive_cutoff'])
+
+
+##                                                                              
+## calculate and assign microenvironment statuses (Pos.Env, Neg.Env, Mixed.Env, noEnv)
+##                                                                              
+rule assign_hrs_microenvironments:                                            
+    input:                                                                      
+        config['cell_data_dir'] + "/{sample}_annotated_cells.rda",              
+        config['neighbor_dir'] + "/{sample}___" + getSampleFileSfx(config['neighbor_dir'])
+    output:                                                                     
+        config['microenvironment_dir'] + '/{sample}___HRS___microenvironments__fPos_' + str(config['positive_cutoff']) + '__minCells_' + str(int(config['min_microenv_cells'])) + '.rda'
+    resources:                                                                  
+        threads = int(config['number_threads']),                                
+        mem = 120                                                               
+    shell:                                                                      
+        "{Rpath}/Rscript {src}/scripts/assign_microenvironments.R " +           
+            " --annotated_cells_file " + config['cell_data_dir'] + "/{wildcards.sample}_annotated_cells.rda" +
+            " --neighbor_file " + config['neighbor_dir'] + "/{wildcards.sample}___" + getSampleFileSfx(config['neighbor_dir']) +
+            " --neighbor_cell_class HRS " +                                     
+            " --meta_dir " + config['meta_dir'] +                               
+            " --microenvironment_dir " + config['microenvironment_dir'] +       
+            " --min_microenv_cells " + str(int(config['min_microenv_cells'])) + 
+            " --positive_cutoff " + str(config['positive_cutoff'])              
+
+
+rule tme_population_counts_and_fractions:
+    input:
+        config['microenvironment_dir'] + '/{sample}___HRS,{marker}___microenvironments__fPos_' + str(config['positive_cutoff']) + '__minCells_' + str(int(config['min_microenv_cells'])) + '.rda'
+    output:
+        config['microenvironment_metrics_dir'] + '/{sample}_population_counts_per__FOV_ID___HRS,{marker}.rda',
+        config['microenvironment_metrics_dir'] + '/{sample}_population_fractions_per__FOV_ID___HRS,{marker}.rda'
+    resources:
+        threads = int(config['number_threads']),
+        mem = 30,
+        runtime = 30000
+    params:
+        marker_param = lambda w: '' if w.marker == '' else " --neighbor_cell_marker_combo " + w.marker
+    shell:
+        "{Rpath}/Rscript {src}/scripts/tme_counts_and_fractions.R " +
+            " --calc_unit FOV_ID " +
+            " --cell_data_dir " + config['cell_data_dir'] +
+            " --cell_dive_id {wildcards.sample} " +
+            " --meta_dir " + config['meta_dir'] +
+            " --microenvironment_dir " + config['microenvironment_dir'] +
+            " --microenvironment_metrics_dir " + config['microenvironment_metrics_dir'] +
+            " --min_microenv_cells " + str(config['min_microenv_cells']) +      
+            " --positive_cutoff " + str(config['positive_cutoff']) + 
+            " --neighbor_cell_class HRS " +
+            " --neighbor_cell_marker_combo {wildcards.marker}" + 
+            " --number_threads " + str(config['number_threads']) +
+            " --statistics_conditions_file " + config['statistics_conditions_file'] +
+            " --statistics_conditions_index " + config['statistics_conditions_index']
+
+rule hrs_tme_population_counts_and_fractions:
+    input:                                                                      
+        config['microenvironment_dir'] + '/{sample}___HRS___microenvironments__fPos_' + str(config['positive_cutoff']) + '__minCells_' + str(int(config['min_microenv_cells'])) + '.rda'
+    output:                                                                     
+        config['microenvironment_metrics_dir'] + '/{sample}_population_counts_per__FOV_ID___HRS.rda',
+        config['microenvironment_metrics_dir'] + '/{sample}_population_fractions_per__FOV_ID___HRS.rda'
+    resources:                                                                  
+        threads = int(config['number_threads']),                                
+        mem = 30,                                                               
+        runtime = 30000                                                         
+    shell:                                                                      
+        "{Rpath}/Rscript {src}/scripts/tme_counts_and_fractions.R " +           
+            " --calc_unit FOV_ID " +                                            
+            " --cell_data_dir " + config['cell_data_dir'] +                     
+            " --cell_dive_id {wildcards.sample} " +                             
+            " --meta_dir " + config['meta_dir'] +                               
+            " --microenvironment_dir " + config['microenvironment_dir'] +       
+            " --microenvironment_metrics_dir " + config['microenvironment_metrics_dir'] +
+            " --min_microenv_cells " + str(config['min_microenv_cells']) +      
+            " --positive_cutoff " + str(config['positive_cutoff']) + 
+            " --neighbor_cell_class HRS " +                                     
+            " --number_threads " + str(config['number_threads']) +              
+            " --statistics_conditions_file " + config['statistics_conditions_file'] +
+            " --statistics_conditions_index " + config['statistics_conditions_index']
+
+##                                                                              
+## calculate and assign microenvironment statuses                               
+##                                                                              
+rule assign_hrs_aggregate_microenvironments:                                            
+    input:                                                                      
+        config['cell_data_dir'] + "/{sample}_annotated_cells.rda",              
+        config['neighbor_dir'] + "/{sample}___" + getSampleFileSfx(config['neighbor_dir'])
+    output:                                                                     
+       config['microenvironment_dir'] + '/{sample}___HRS_aggregated___microenvironments__frAgg_' + str(config['positive_cutoff']) + '__minCells_' + str(int(config['min_microenv_cells'])) + '.rda' 
+    resources:                                                                  
+        threads = int(config['number_threads']),                                
+        mem = 120                                                               
+    shell:                                                                      
+        "{Rpath}/Rscript {src}/scripts/assign_hrs_aggregate_microenvironments.R " +           
+            " --annotated_cells_file " + config['cell_data_dir'] + "/{wildcards.sample}_annotated_cells.rda" +
+            " --cell_dive_id {wildcards.sample} " +
+            " --neighbor_file " + config['neighbor_dir'] + "/{wildcards.sample}___" + getSampleFileSfx(config['neighbor_dir']) +
+            " --neighbor_cell_class HRS " +                                     
+            " --meta_dir " + config['meta_dir'] +                               
+            " --microenvironment_dir " + config['microenvironment_dir'] +       
+            " --min_microenv_cells " + str(config['min_microenv_cells']) + 
+            " --positive_cutoff " + str(config['positive_cutoff'])                                          
+
+
+rule hrs_aggregate_population_counts_and_fractions:                                       
+    input:                                                                      
+        config['microenvironment_dir'] + '/{sample}___HRS_aggregated___microenvironments__frAgg_' + str(config['positive_cutoff']) + '__minCells_' + str(int(config['min_microenv_cells'])) + '.rda'
+    output:                                                                     
+        config['microenvironment_metrics_dir'] + '/{sample}_population_counts_per__FOV_ID___HRS__aggregated.rda',
+        config['microenvironment_metrics_dir'] + '/{sample}_population_fractions_per__FOV_ID___HRS__aggregated.rda'
+    resources:                                                                  
+        threads = int(config['number_threads']),                                
+        mem = 30,                                                               
+        runtime = 30000                                                         
+    shell:                                                                      
+        "{Rpath}/Rscript {src}/scripts/hrs_aggregate_tme_counts_and_fractions.R " +           
+            " --calc_unit FOV_ID " +                                            
+            " --cell_data_dir " + config['cell_data_dir'] +                     
+            " --cell_dive_id {wildcards.sample} " +                             
+            " --meta_dir " + config['meta_dir'] +                               
+            " --microenvironment_dir " + config['microenvironment_dir'] +       
+            " --microenvironment_metrics_dir " + config['microenvironment_metrics_dir'] +
+            " --min_microenv_cells " + str(config['min_microenv_cells']) +      
+            " --positive_cutoff " + str(config['positive_cutoff']) +
+            " --neighbor_cell_class HRS " +                                     
+            " --neighbor_cell_marker_combo aggregated " +               
+            " --number_threads " + str(config['number_threads']) +              
+            " --statistics_conditions_file " + config['statistics_conditions_file'] +
+            " --statistics_conditions_index " + config['statistics_conditions_index']
+
+
+       
+##                                                                              
+## for each sample comparison, create a XLSX report of cell fraction odds ratios, 
+## cell density fold changes, confidence intervals, p values and FDR            
+##                                                                              
+rule report_general_statistics:                                                 
+    input:                                                                      
+        expand(config['fov_metrics_dir'] + '/{sample}_population_{metric}_per_FOV_ID.rda', sample = SAMPLES, metric = allMetrics),
+        cond_file = config['statistics_conditions_file'],                       
+        cond_index = config['statistics_conditions_index'],                     
+        quest_file = qFile                                                     
+    output:                                                                     
+        config['statistics_general_tables_dir'] + '/{question}.xlsx'                    
+    resources:                                                                  
+        threads = int(config['number_threads']),                                
+        mem = 32                                                                
+    shell:                                                                      
+        "{Rpath}/Rscript {src}/scripts/report_statistics.R" +                   
+             " --annotation_config_file " + config['annotation_config_file'] +  
+             " --cell_data_dir " + config['cell_data_dir'] +                    
+             " --fov_area_dir " + config['fov_area_dir'] +                      
+             " --meta_dir " + config['meta_dir'] +                              
+             " --fov_metrics_dir " + config['fov_metrics_dir'] +                
+             " --number_threads " + str(config['number_threads']) +             
+             " --question {wildcards.question}" +                               
+             " --statistics_config_file " + config['statistics_config_file'] +  
+             " --statistics_conditions_file {input.cond_file}" +                
+             " --statistics_conditions_index {input.cond_index}" +              
+             " --statistics_questions_file {input.quest_file}" +                
+             " --statistics_tables_dir " + config['statistics_general_tables_dir']      
+
+
+##
+## for each sample comparison, create a XLSX report of cell fraction odds ratios, 
+## fold changes, confidence intervals, p values and FDR 
+##
+## PROBLEM (sort of): if any one of the input files is missing, report stats is 
+## still run for all questions; not a huge deal because it's a relatively quick
+## script but definitely needs to be improved
+rule report_microenvironment_statistics:
+    input:
+        expand(config['microenvironment_metrics_dir'] + "/{sample}_population_fractions_per__FOV_ID___HRS,{marker}.rda", sample = SAMPLES, marker = tmeMarkers),
+        expand(config['microenvironment_metrics_dir'] + "/{sample}_population_fractions_per__FOV_ID___HRS.rda", sample = SAMPLES),
+        expand(config['microenvironment_metrics_dir'] + '/{sample}_population_fractions_per__FOV_ID___HRS__aggregated.rda', sample = SAMPLES),
+        cond_file = config['statistics_conditions_file'],
+        cond_index = config['statistics_conditions_index'],
+        quest_file = qFile
+    output:
+        config['statistics_microenvironment_tables_dir'] + "/{tme_question}.xlsx"
+    resources:
+        threads = int(config['number_threads']),
+        mem = 32
+    shell:
+        "{Rpath}/Rscript {src}/scripts/report_statistics.R" +
+             " --annotation_config_file " + config['annotation_config_file'] +
+             " --cell_data_dir " + config['cell_data_dir'] +
+             " --fov_area_dir " + config['fov_area_dir'] +
+             " --meta_dir " + config['meta_dir'] +
+             " --fov_metrics_dir " + config['microenvironment_metrics_dir'] +
+             " --number_threads " + str(config['number_threads']) +
+             " --question {wildcards.tme_question}" +
+             " --statistics_config_file " + config['statistics_config_file'] +
+             " --statistics_conditions_file {input.cond_file}" + 
+             " --statistics_conditions_index {input.cond_index}" +  
+             " --statistics_questions_file {input.quest_file}" +
+             " --statistics_tables_dir " + config['statistics_microenvironment_tables_dir'] 
+
+
+
+##
+## plot filtered cell fractions and densities (1 data point per FOV) and
+## the corresponding effect sizes and confidence intervals
+rule plot_general_stats_detail:
+    input:
+        config['statistics_general_tables_dir'] + '/{question}.xlsx',
+    output:
+        expand(config['statistics_general_detail_dir'] + '/{{question}}_{calc}_detail.{ext}', calc = genPlotCalcs, ext = plotExts)
+    resources:
+        threads = int(config['number_threads']),
+        mem = 24
+    shell:
+        "{Rpath}/Rscript {src}/scripts/plot_stats_detail.R " +
+            " --detail_figure_config_file " + config['detail_figure_config_file'] +
+            " --figure_config_file " + config['detail_figure_config_file'] +
+            " --fov_area_dir " + config['fov_area_dir'] +
+            " --fov_metrics_dir " + config['fov_metrics_dir'] +
+            " --meta_dir " + config['meta_dir'] +
+            " --microenvironment_metrics_dir " + config['microenvironment_metrics_dir'] +
+            " --number_threads " + str(config['number_threads']) +
+            " --plot_config_file " + config['plot_config_file'] + 
+            " --question {wildcards.question}" +
+            " --statistics_conditions_file " + config['statistics_conditions_file'] +
+            " --statistics_conditions_index " + config['statistics_conditions_index'] +
+            " --statistics_config_file " + config['statistics_config_file'] +
+            " --statistics_detail_dir " + config['statistics_general_detail_dir'] +
+            " --statistics_tables_dir " + config['statistics_general_tables_dir'] 
+
+rule plot_microenvironment_stats_detail:                                                 
+    input:                                                                      
+        config['statistics_microenvironment_tables_dir'] + '/{question}.xlsx',           
+    output:                                                                     
+        expand(config['statistics_microenvironment_detail_dir'] + '/{{question}}_{calc}_detail.{ext}', calc = spPlotCalcs, ext = plotExts)
+    resources:                                                                  
+        threads = int(config['number_threads']),                                
+        mem = 24                                                                
+    shell:                                                                      
+        "{Rpath}/Rscript {src}/scripts/plot_stats_detail.R " +                  
+            " --detail_figure_config_file " + config['detail_figure_config_file'] +
+            " --figure_config_file " + config['detail_figure_config_file'] +    
+            " --fov_area_dir " + config['fov_area_dir'] +                       
+            " --fov_metrics_dir " + config['fov_metrics_dir'] +                 
+            " --meta_dir " + config['meta_dir'] +                               
+            " --microenvironment_metrics_dir " + config['microenvironment_metrics_dir'] +
+            " --number_threads " + str(config['number_threads']) +              
+            " --plot_config_file " + config['plot_config_file'] +               
+            " --question {wildcards.question}" +                                
+            " --statistics_conditions_file " + config['statistics_conditions_file'] +
+            " --statistics_conditions_index " + config['statistics_conditions_index'] +
+            " --statistics_config_file " + config['statistics_config_file'] +   
+            " --statistics_detail_dir " + config['statistics_microenvironment_detail_dir'] +
+            " --statistics_tables_dir " + config['statistics_microenvironment_tables_dir']
+
+
+rule plot_drift_summaries:
+    input:
+        config['meta_data_file'],
+        expand(config['drift_summary_dir'] + '/{sample}_drift_summary.txt.gz', sample = SAMPLES)
+    output:
+        config['study_figure_dir'] + '/drift_by_cycle.pdf',
+        config['study_figure_dir'] + '/drift_by_cycle.xlsx',
+        config['study_figure_dir'] + '/drift_by_sample.pdf',
+        config['study_figure_dir'] + '/drift_by_sample.xlsx'
+    resources:
+        threads = int(config['number_threads']),
+        mem = 24
+    shell:
+        "{Rpath}/Rscript {src}/scripts/plot_drift.R " +
+            " --drift_summary_dir " + config['drift_summary_dir'] +
+            " --meta_dir " + config['meta_dir'] +
+            " --number_threads " + str(config['number_threads']) +
+            " --study_figure_dir " + config['study_figure_dir']
+
+rule plot_study_overview:
+    input:
+        config['meta_data_file']
+    output:
+        config['study_figure_dir'] + "/study_overview.pdf"
+    shell:
+        "{Rpath}/Rscript {src}/scripts/plot_study_overview.R " +
+            " --meta_dir " + config['meta_dir'] +
+            " --plot_config_file " + config['plot_config_file'] +
+            " --study_figure_dir " + config['study_figure_dir'] +
+            " --xVar Patient_ID"
+
+rule plot_fov_counts_by_patient:
+    input:
+        config['meta_data_file']
+    output:
+        config['study_figure_dir'] + "/fov_counts_per_Patient_ID.pdf"
+    shell:
+        "{Rpath}/Rscript {src}/scripts/plot_fov_counts.R " +
+            " --meta_dir " + config['meta_dir'] +
+            " --study_figure_dir " + config['study_figure_dir'] +
+            " --xVar Patient_ID"
+
+rule plot_cell_counts_by_patient:
+    input:
+        expand(config['cell_data_dir'] + "/{sample}_annotated_cells.rda", sample=SAMPLES), 
+        config['plot_config_file'],
+        config['meta_data_file']
+    output:
+        config['study_figure_dir'] + '/cell_type__counts_by__Patient_ID.pdf',
+        config['study_figure_dir'] + '/cell_type__counts_by__Patient_ID.xlsx'
+    resources:
+        threads = int(config['number_threads']),
+        mem = 24
+    shell:
+        "{Rpath}/Rscript {src}/scripts/plot_cell_type_counts.R " +
+            " --cell_data_dir " + config['cell_data_dir'] +
+            " --meta_dir " + config['meta_dir'] +
+            " --number_threads " + str(config['number_threads']) +
+            " --plot_config_file " + config['plot_config_file'] +
+            " --study_figure_dir " + config['study_figure_dir'] +
+            " --x_var Patient_ID"
+
+rule plot_fov_variation:
+    input:
+        expand(config['cell_data_dir'] + "/{sample}_annotated_cells.rda", sample=SAMPLES)
+    output:
+        config['study_figure_dir'] + '/fov_variation_heatmap.pdf'
+    resources:
+        threads = int(config['number_threads']),
+        mem = 24
+    shell:
+        "{Rpath}/Rscript {src}/scripts/plot_fov_variation.R " +
+            " --cell_data_dir " + config['cell_data_dir'] +
+            " --meta_dir " + config['meta_dir'] +
+            " --number_threads " + str(config['number_threads']) +
+            " --study_figure_dir " + config['study_figure_dir'] +
+            " --annotation_columns Patient_ID,EBV_final"  #### TEMPORARY  
+
+######## HELPER RULES #######
+
+##
+## run all counts, fractions and densities per FOV_ID
+##
+rule fov_metrics:
+    input:
+        expand(config['fov_metrics_dir'] + '/{sample}_population_{metric}_per_FOV_ID.rda', sample = SAMPLES, metric = allMetrics)
+
+
+##
+## annotate all samples
+##
+rule annotate_cells:
+    input:
+        config['meta_data_file'],
+        expand(config['cell_data_dir'] + "/{sample}_annotated_cells.rda", sample=SAMPLES)
+
+##
+## run everything up to counts
+##
+rule all_counts:
+    input:
+        rules.summarize_cell_counts.output,
+        rules.summarize_marker_counts.output,
+        rules.plot_cell_counts_by_patient.output,                               
+        rules.plot_fov_variation.output
+
+##
+## run TME counts and fractions
+##
+rule tme_metrics:
+    input:
+        expand(config['microenvironment_metrics_dir'] + '/{sample}_population_counts_per__FOV_ID___HRS,{marker}.rda', sample = SAMPLES, marker = tmeMarkers),
+        expand(config['microenvironment_metrics_dir'] + '/{sample}_population_fractions_per__FOV_ID___HRS.rda', sample = SAMPLES)
+
+
+##
+## assign all tumor microenvironments needed, as outlined in Questions file
+##
+rule assign_functional_tme:
+    input:
+        expand(config['microenvironment_dir'] + '/{sample}___HRS,{marker}___microenvironments__fPos_' + str(config['positive_cutoff']) + '__minCells_' + str(int(config['min_microenv_cells'])) + '.rda', sample = SAMPLES, marker = tmeMarkers)
+
+
+rule assign_hrs_tme:
+    input:
+        expand(config['microenvironment_dir'] + '/{sample}___HRS___microenvironments__fPos_' + str(config['positive_cutoff']) + '__minCells_' + str(int(config['min_microenv_cells'])) + '.rda', sample = SAMPLES)
+
+
+rule assign_hrs_aggregate_tme:
+    input:                                                                      
+        expand(config['microenvironment_dir'] + '/{sample}___HRS_aggregated___microenvironments__frAgg_' + str(config['positive_cutoff']) + '__minCells_' + str(int(config['min_microenv_cells'])) + '.rda', sample = SAMPLES)
+
+
+rule hrs_aggregate_metrics:
+    input:
+        expand(config['microenvironment_metrics_dir'] + '/{sample}_population_counts_per__FOV_ID___HRS__aggregated.rda', sample = SAMPLES),
+        expand(config['microenvironment_metrics_dir'] + '/{sample}_population_fractions_per__FOV_ID___HRS__aggregated.rda', sample = SAMPLES)
+
+    
+##
+## initial QC
+##
+rule QC0:
+    input:
+        rules.plot_study_overview.output,
+        rules.plot_fov_counts_by_patient.output,
+        rules.plot_drift_summaries.output
+    output:
+        'logs/QC0_COMPLETE'
+    shell:
+        'touch {output}'
+
+##
+## pre-analysis QC 
+##
+rule QC1:
+    input:
+        rules.summarize_cell_counts.output,
+        rules.summarize_marker_counts.output,
+        rules.plot_cell_counts_by_patient.output,
+        rules.plot_fov_variation.output
+    output:                                                                     
+        'logs/QC1_COMPLETE'                                                     
+    shell:                                                                      
+        'touch {output}'                                                        
+
+rule run_general_stats:
+    input:                                                                      
+        expand(config['statistics_general_tables_dir'] + '/{question}.xlsx', question = GENERAL_Q),
+        expand(config['statistics_general_detail_dir'] + '/{question}_{calc}_detail.{ext}', question = GENERAL_Q, calc = genPlotCalcs, ext = plotExts)
+    output:                                                                     
+        'logs/GENERAL_STATS_COMPLETE'                                                     
+    shell:                                                                      
+        'touch {output}'                                                        
+
+
+rule run_microenvironment_stats:
+    input:                                                                      
+        expand(config['statistics_microenvironment_tables_dir'] + '/{tme_question}.xlsx', tme_question = TME_Q),
+        expand(config['statistics_microenvironment_detail_dir'] + '/{tme_question}_{calc}_detail.{ext}', tme_question = TME_Q, calc = spPlotCalcs, ext = plotExts)
+    output:                                                                     
+        'logs/MICROENVIRONMENT_STATS_COMPLETE'                                                     
+    shell:                                                                      
+        'touch {output}'                                                        
+
+rule plot_tme_stats_detail:
+    input:
+        expand(config['statistics_microenvironment_detail_dir'] + '/{tme_question}_{calc}_detail.{ext}', tme_question = TME_Q, calc = spPlotCalcs, ext = plotExts)
+
+rule run_stats:
+    input:
+        expand(config['statistics_general_tables_dir'] + '/{question}.xlsx', question = GENERAL_Q),
+        expand(config['statistics_general_detail_dir'] + '/{question}_{calc}_detail.{ext}', question = GENERAL_Q, calc = genPlotCalcs, ext = plotExts),
+        expand(config['statistics_microenvironment_tables_dir'] + '/{tme_question}.xlsx', tme_question = TME_Q),
+        expand(config['statistics_microenvironment_detail_dir'] + '/{tme_question}_{calc}_detail.{ext}', tme_question = TME_Q, calc = spPlotCalcs, ext = plotExts)
+    output:
+        'logs/ALL_STATS_COMPLETE'
+    shell:
+        'touch {output}'
+
+rule all:
+    input:
+        rules.QC0.output,
+        rules.QC1.output,
+        rules.run_stats.output
+    output:
+        'logs/PIPELINE_COMPLETE'
+    shell:
+        'touch {output}'
+

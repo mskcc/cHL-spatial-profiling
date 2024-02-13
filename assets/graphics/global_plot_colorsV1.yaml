@@ -1,0 +1,44 @@
+# red
+HRS: '#D83631'
+
+# blues/greens
+T_All: '#2073ac'
+T_CD4: '#3475BE'  ##'#6077c4' #'#0977c4' # '#17527a'
+T_CD8: '#53AAAA' #'#2689cd'
+T_Reg4: '#749BD6'   ##'#999cdb'    ###'#819cdb'  # '#3f9cdb'
+T_Reg8: '#8FC0BF'  #'#71b5e5'
+T_RegDN: '#AEDCEC'
+T_CD4/CD8: '#4488A9' #'#c3e0f4'
+T_Null: '#DBF6F7'
+
+# green
+B_All: '#33a547'
+
+# oranges
+NK_All: '#ff7423'
+NK: '#e67300'
+NKT: '#ffae80'
+NKT_CD8: '#ffcc66'
+NKT_CD4: '#ffd9b3'
+
+# purples
+Macrophage_All: '#924596'
+Macrophage_Other: '#6a4596'
+Macrophage_MHCIIpos: '#bf7bc2'
+Macrophage_MHCIIneg: '#e6cbe7'
+
+# pink
+Plasma: '#ff76b6'
+#brown
+Granulocyte: '#a24c29'
+#charcoal
+Leukocyte_Other: '#343434'
+#darkgray
+superNeg: '#7b7b7b'
+#lightgray
+UNKNOWN: '#e8e8e8'
+
+
+
+
+

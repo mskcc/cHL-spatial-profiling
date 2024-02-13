@@ -1,0 +1,66 @@
+HRS: '#D83631'
+
+T_All: '#2073AC'
+T_CD4: '#63C5DA'
+T_CD8: '#48AAAD'
+T_Reg4: '#0492C2'
+T_Reg8: '#016064'
+T_RegDN: '#1F456E'
+T_CD4/CD8: '#4488A9'
+T_Null: '#DBF6F7'
+
+B_All: '#33A547'
+
+NK_All: '#FF7423'
+NK: '#FCAE1E'
+NKT: '#FDA172'
+NKT_CD8: '#D67229'
+NKT_CD4: '#ED820E'
+
+Macrophage_All: '#924596'
+Macrophage_MHCIIpos: '#B65FCF'
+Macrophage_MHCIIneg: '#6A4596'
+Macrophage_Other: '#E6CBE7'
+
+Plasma: '#FF76B6'
+
+Leukocyte_Other: '#D6D8D6'
+
+superNeg: '#7B7B7B'
+
+UNKNOWN: '#434443'
+
+# ["Negative", "Positive"]
+EBV_final: ['#A7BEAE', '#B85042']
+
+Patient_ID_FINAL:
+  HL_01: '#2d78bd'
+  HL_02: '#000075'
+  HL_03: '#ed2224'
+  HL_04: '#36a047'
+  HL_05: '#664b9e'
+  HL_06: '#f57f20'
+  HL_07: '#575757'
+  HL_08: '#fdd700'
+  HL_09: '#a6cee2'
+  HL_10: '#f06495'
+  HL_11: '#b4d88b'
+  HL_12: '#cab3d6'
+  HL_13: '#fdbf6f'
+  HL_14: '#989898'
+  HL_15: '#ed7a7a'
+  HL_16: '#eee584'
+  HL_17: '#c9328d'
+  HL_18: '#d58ebd'
+  HL_19: '#9752a0'
+  HL_20: '#bc9c33'
+  HL_21: '#3a53a4'
+  HL_22: '#37658b'
+  HL_23: '#56c6d2'
+  HL_24: '#b62025'
+  HL_25: '#6abd45'
+  HL_26: '#86cdb1'
+  HL_27: '#768c39'
+  HL_28: '#bdbf32'
+  HL_29: '#897537'
+  HL_30: '#8b3e1e'

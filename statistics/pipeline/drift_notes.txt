@@ -1,0 +1,21 @@
+## CJ 2021-04-13
+
+## When running ImageMagick convert with Zheng's installation, it threw errors
+## because it couldn't find certain config files that define fonts and whatnot. 
+## His installation was originally configured and installed in /ifs, so all 
+## settings were pointing there. After reinstalling in /juno/work, it worked just fine. 
+
+
+## INSTALL
+wget https://www.imagemagick.org/download/ImageMagick.tar.gz
+tar xvzf ImageMagick.tar.gz
+cd ImageMagick-7.0.11-7
+./configure --prefix=/home/byrne/halo/dev/hodgkins_dev/bin/ImageMagick-7.0.11-7
+make
+make install
+cd ../
+rm -r ImageMagick-7.0.11-7
+
+## TEST
+export MAGICK_TMPDIR=/juno/work/bic/byrne/tmp && export MAGICK_MEMORY_LIMIT=10240 && export MAGICK_MAP_LIMIT=10240 && /home/byrne/halo/dev/hodgkins_dev//bin/ImageMagick-7.0.11-7/bin/convert preprocessing/drift/drift_mask/H17_173/S001_S030/S001_S030_011/H17_173_S001_S030_011_overlay.tif preprocessing/drift/drift_mask/H17_173/S001_S030/S001_S030_011/H17_173_S001_S030_011_diff_mask.tif -resize 1280 -gravity South -splice 0x40 -pointsize 20 -annotate 0 '%f' test.pdf
+
