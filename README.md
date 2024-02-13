@@ -2,6 +2,8 @@
 
 ## Multiplexed IF analysis
 
+- For Halo->RDA used: ver/halo_v3.5.1 of the HaloX repo
+
 *scripts/misc* contains R scripts for cell reassignments, UMAP clustering, HRS aggregate analysis. 
 
 *statistics* contains R scripts for all statistical analyses. 
