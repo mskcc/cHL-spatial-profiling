@@ -1,6 +1,7 @@
 # Spatial profiling of classic Hodgkin lymphoma (cHL)
 
-### Code supporting manuscript: "Multiplexed spatial profiling of Hodgkin Reed-Sternberg cell neighborhoods in Classic Hodgkin lymphoma unveils distinct immune escape mechanisms"
+#### Code supporting manuscript:
+#### "Multiplexed spatial profiling of Hodgkin Reed-Sternberg cell neighborhoods in Classic Hodgkin lymphoma unveils distinct immune escape mechanisms"
 
 ## Multiplexed IF analysis
 
