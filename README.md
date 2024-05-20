@@ -1,25 +1,24 @@
 # Spatial profiling of classic Hodgkin lymphoma (cHL)
 
 #### Code supporting manuscript:
-#### "Multiplexed spatial profiling of Hodgkin Reed-Sternberg cell neighborhoods in Classic Hodgkin lymphoma"
+#### *Multiplexed spatial profiling of Hodgkin Reed-Sternberg cell neighborhoods in Classic Hodgkin lymphoma*
 
 ## Multiplexed IF analysis
 
-- For Halo->RDA used: https://github.com/mskcc/cHL-pre-processing, which is a fork of `HaloX` repo branch `ver/halo_v3.5.1`
+- Install `snakemake`, `R 4.0.2`, and all libraries in `statistics/source_all.R`
 
-*scripts/misc* contains R scripts for cell reassignments, UMAP clustering, HRS aggregate analysis. 
+- For reformatting of HALO output (csv files) to `RDA` files, please reference: https://github.com/mskcc/cHL-pre-processing
+- This is a fork of `HaloX` repo branch `ver/halo_v3.5.1`
 
-*statistics* contains R scripts for all statistical analyses. 
+- `scripts/misc` contains R scripts for cell reassignments, UMAP clustering, and HRS aggregate analysis. `reassignment_rules.md` contains cell reassignment hierarchy. 
 
-Refer to *reassignment.md* for Hodgkin cell reassignment hierarchy. 
+- `statistics` contains R scripts for all statistical analyses.
 
+## Bulk transcriptomic analysis
 
-## Transcriptome
+- `NanoString/hodgkin_rna_analysis.Rmd` contains all code for analysis of RNA sequencing data and generation of paper figures. 
 
-Contains R script for analysis of NanoString data and RNA sequencing data with some plotting for figures. 
+## Raw data
 
-Contains *rawdata* files used in R script. 
-
-Install snakemake, install R 4.0.2 and all libraries in source_all.R
-
-To run analysis, run
+- Please reference: https://zenodo.org/records/10659311
+- Contains raw multiplexed IF data and files referenced in `NanoString/hodgkin_rna_analysis.Rmd`.
