@@ -5,13 +5,9 @@
 
 ## Multiplexed IF analysis
 
-- Install `snakemake`, `R 4.0.2`, and all libraries in `statistics/source_all.R`
-
-- For reformatting of HALO output (csv files) to `RDA` files, please reference: https://github.com/mskcc/cHL-pre-processing
-- This is a fork of `HaloX` repo branch `ver/halo_v3.5.1`
-
+- Install `snakemake`, `R 4.0.2`, and all libraries in `statistics/source_all.R`.
+- For reformatting of HALO output (csv files) to `RDA` files, please reference: https://github.com/mskcc/cHL-pre-processing. This is a fork of `HaloX` repo branch `ver/halo_v3.5.1`.
 - `scripts/misc` contains R scripts for cell reassignments, UMAP clustering, and HRS aggregate analysis. `reassignment_rules.md` contains cell reassignment hierarchy. 
-
 - `statistics` contains R scripts for all statistical analyses.
 
 ## Bulk transcriptomic analysis
