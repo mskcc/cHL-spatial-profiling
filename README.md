@@ -1,7 +1,7 @@
 # Spatial profiling of classic Hodgkin lymphoma (cHL)
 
 #### Code supporting manuscript:
-#### *Multiplexed spatial profiling of Hodgkin Reed-Sternberg cell neighborhoods in Classic Hodgkin lymphoma*
+#### *Multiplexed spatial profiling of Hodgkin Reed-Sternberg cell neighborhoods in classic Hodgkin lymphoma*
 
 ## Multiplexed IF analysis
 
